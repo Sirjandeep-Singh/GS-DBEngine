@@ -7,6 +7,7 @@
 // Nothing above this layer ever reads partial pages.
 
 static const uint32_t PAGE_SIZE = 4096;
+static const uint32_t INVALID_PAGE        = 0xFFFFFFFF;  // sentinel: page does not exist yet
 
 // Page 0 is always the database header.
 // All other pages are B+ tree nodes, schema table entries, or free pages.

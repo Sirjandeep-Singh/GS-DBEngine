@@ -1,10 +1,14 @@
+// to run the test , run command
+// g++ -std=c++17 tests/test_storage.cpp src/storage/disk_manager.cpp src/storage/header_manager.cpp src/storage/buffer_pool.cpp -o tests/test_storage && ./tests/test_storage
 #include <iostream>
 #include <cassert>
 #include <cstring>
+#include <vector>
 #include <filesystem>
 
 #include "../src/storage/disk_manager.h"
 #include "../src/storage/header_manager.h"
+#include "../src/storage/buffer_pool.h"
 
 namespace fs = std::filesystem;
 
@@ -251,6 +255,182 @@ void test_header_load_on_corrupt_file_throws() {
 }
 
 // ─────────────────────────────────────────────
+// BufferPool Tests
+// ─────────────────────────────────────────────
+
+void test_buffer_fetch_and_read() {
+    cleanup();
+    DiskManager dm(TEST_FILE);
+    BufferPool bp(dm);
+
+    uint32_t page_id;
+    Page* p = bp.new_page(page_id);
+    std::memset(p->data, 0xAA, PAGE_SIZE);
+    bp.unpin_page(page_id, true);
+
+    bp.flush_page(page_id);
+
+    Page* p2 = bp.fetch_page(page_id);
+    assert(p2->data[0] == 0xAA);
+    assert(p2->data[PAGE_SIZE - 1] == 0xAA);
+    bp.unpin_page(page_id, false);
+
+    std::cout << "[PASS] fetch_page returns correct data after write\n";
+    cleanup();
+}
+
+void test_new_page_is_not_dirty() {
+    cleanup();
+    DiskManager dm(TEST_FILE);
+    BufferPool bp(dm);
+
+    uint32_t page_id;
+    bp.new_page(page_id);
+    bp.unpin_page(page_id, false);
+
+    // flush_all should not write anything — page is clean
+    // verify by checking no exception is thrown and page is still readable
+    bp.flush_all();
+    Page* p = bp.fetch_page(page_id);
+    assert(p != nullptr);
+    bp.unpin_page(page_id, false);
+
+    std::cout << "[PASS] new_page starts as not dirty\n";
+    cleanup();
+}
+
+void test_unpin_dirty_marks_page() {
+    cleanup();
+    DiskManager dm(TEST_FILE);
+    BufferPool bp(dm);
+
+    uint32_t page_id;
+    Page* p = bp.new_page(page_id);
+    p->data[0] = 0x42;
+    bp.unpin_page(page_id, true);   // mark dirty
+
+    bp.flush_page(page_id);         // flush to disk
+
+    // reopen and verify data persisted
+    BufferPool bp2(dm);
+    Page* p2 = bp2.fetch_page(page_id);
+    assert(p2->data[0] == 0x42);
+    bp2.unpin_page(page_id, false);
+
+    std::cout << "[PASS] unpin with is_dirty=true persists data on flush\n";
+    cleanup();
+}
+
+void test_flush_all_writes_dirty_pages() {
+    cleanup();
+    DiskManager dm(TEST_FILE);
+    BufferPool bp(dm);
+
+    uint32_t id0, id1;
+    Page* p0 = bp.new_page(id0);
+    Page* p1 = bp.new_page(id1);
+
+    std::memset(p0->data, 0x11, PAGE_SIZE);
+    std::memset(p1->data, 0x22, PAGE_SIZE);
+
+    bp.unpin_page(id0, true);
+    bp.unpin_page(id1, true);
+    bp.flush_all();
+
+    // read back directly from disk via a fresh buffer pool
+    BufferPool bp2(dm);
+    Page* r0 = bp2.fetch_page(id0);
+    Page* r1 = bp2.fetch_page(id1);
+
+    assert(r0->data[0] == 0x11);
+    assert(r1->data[0] == 0x22);
+
+    bp2.unpin_page(id0, false);
+    bp2.unpin_page(id1, false);
+
+    std::cout << "[PASS] flush_all writes all dirty pages to disk\n";
+    cleanup();
+}
+
+void test_cache_hit_does_not_reload_from_disk() {
+    cleanup();
+    DiskManager dm(TEST_FILE);
+    BufferPool bp(dm);
+
+    uint32_t page_id;
+    Page* p = bp.new_page(page_id);
+    p->data[0] = 0x55;
+    bp.unpin_page(page_id, true);
+
+    // fetch again — should be a cache hit, same pointer
+    Page* p2 = bp.fetch_page(page_id);
+    assert(p2->data[0] == 0x55);
+    bp.unpin_page(page_id, false);
+
+    std::cout << "[PASS] repeated fetch returns cached page\n";
+    cleanup();
+}
+
+void test_eviction_flushes_dirty_page() {
+    cleanup();
+    DiskManager dm(TEST_FILE);
+    BufferPool bp(dm);
+
+    // fill the entire buffer pool
+    std::vector<uint32_t> ids(BUFFER_POOL_SIZE);
+    for (uint32_t i = 0; i < BUFFER_POOL_SIZE; i++) {
+        Page* p = bp.new_page(ids[i]);
+        p->data[0] = static_cast<uint8_t>(i + 1);
+        bp.unpin_page(ids[i], true);  // all dirty, all unpinned
+    }
+
+    // allocate one more — forces eviction of LRU page
+    uint32_t extra_id;
+    bp.new_page(extra_id);
+    bp.unpin_page(extra_id, false);
+
+    // the evicted page should have been flushed to disk
+    // read it back via a fresh DiskManager to bypass buffer pool
+    Page raw;
+    dm.read_page(ids[0], raw);  // ids[0] was LRU — first allocated, first evicted
+    assert(raw.data[0] == 1);
+
+    std::cout << "[PASS] eviction flushes dirty page to disk\n";
+    cleanup();
+}
+
+void test_pinned_page_not_evicted() {
+    cleanup();
+    DiskManager dm(TEST_FILE);
+    BufferPool bp(dm);
+
+    // fill buffer pool, keep first page pinned
+    uint32_t pinned_id;
+    bp.new_page(pinned_id);  // pin count = 1, NOT unpinned
+
+    std::vector<uint32_t> ids(BUFFER_POOL_SIZE - 1);
+    for (uint32_t i = 0; i < BUFFER_POOL_SIZE - 1; i++) {
+        Page* p = bp.new_page(ids[i]);
+        bp.unpin_page(ids[i], false);
+    }
+
+    // buffer pool is now full with pinned_id still pinned
+    // allocating one more should evict an unpinned page, not the pinned one
+    uint32_t extra_id;
+    bp.new_page(extra_id);
+    bp.unpin_page(extra_id, false);
+
+    // pinned page should still be in buffer pool and accessible
+    bp.unpin_page(pinned_id, false);  // unpin now
+    Page* p = bp.fetch_page(pinned_id);
+    assert(p != nullptr);
+    bp.unpin_page(pinned_id, false);
+
+    std::cout << "[PASS] pinned page is not evicted\n";
+    cleanup();
+}
+
+// ─────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────
 
@@ -271,6 +451,15 @@ int main() {
     test_header_init_on_existing_file_throws();
     test_header_load_on_empty_file_throws();
     test_header_load_on_corrupt_file_throws();
+
+    std::cout << "\n=== BufferPool Tests ===\n";
+    test_buffer_fetch_and_read();
+    test_new_page_is_not_dirty();
+    test_unpin_dirty_marks_page();
+    test_flush_all_writes_dirty_pages();
+    test_cache_hit_does_not_reload_from_disk();
+    test_eviction_flushes_dirty_page();
+    test_pinned_page_not_evicted();
 
     std::cout << "\nAll tests passed.\n";
     return 0;

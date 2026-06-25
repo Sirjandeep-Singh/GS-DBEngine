@@ -24,7 +24,6 @@
 static const char     DB_MAGIC[16]        = "MYDB_V1";
 static const uint32_t DB_VERSION          = 1;
 static const uint32_t NO_FREE_PAGE        = 0xFFFFFFFF;  // sentinel: free list is empty
-static const uint32_t INVALID_PAGE        = 0xFFFFFFFF;  // sentinel: page does not exist yet
 
 #pragma pack(push, 1)   // disable struct padding — we need exact byte layout on disk
 struct DBHeader {
