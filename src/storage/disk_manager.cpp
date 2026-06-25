@@ -1,12 +1,9 @@
-//Where is it Getting PAGE_SIZE from?
 #include "disk_manager.h"
 
 #include <stdexcept>
 #include <cstring>
 
-// ─────────────────────────────────────────────
 // Constructor
-// ─────────────────────────────────────────────
 
 DiskManager::DiskManager(const std::string& filename)
     : filename_(filename), total_pages_(0)
@@ -42,9 +39,7 @@ DiskManager::DiskManager(const std::string& filename)
     }
 }
 
-// ─────────────────────────────────────────────
 // Destructor
-// ─────────────────────────────────────────────
 
 DiskManager::~DiskManager() {
     if (file_.is_open()) {
@@ -53,9 +48,7 @@ DiskManager::~DiskManager() {
     }
 }
 
-// ─────────────────────────────────────────────
 // read_page
-// ─────────────────────────────────────────────
 
 void DiskManager::read_page(uint32_t page_id, Page& page) {
     if (page_id >= total_pages_) {
@@ -83,9 +76,7 @@ void DiskManager::read_page(uint32_t page_id, Page& page) {
     }
 }
 
-// ─────────────────────────────────────────────
 // write_page
-// ─────────────────────────────────────────────
 
 void DiskManager::write_page(uint32_t page_id, const Page& page) {
     if (page_id >= total_pages_) {
@@ -117,9 +108,7 @@ void DiskManager::write_page(uint32_t page_id, const Page& page) {
     file_.flush();
 }
 
-// ─────────────────────────────────────────────
 // allocate_page
-// ─────────────────────────────────────────────
 
 uint32_t DiskManager::allocate_page() {
     // The new page's id is the current total (pages are 0-indexed).
@@ -144,9 +133,7 @@ uint32_t DiskManager::allocate_page() {
     return new_page_id;
 }
 
-// ─────────────────────────────────────────────
 // total_pages
-// ─────────────────────────────────────────────
 
 uint32_t DiskManager::total_pages() const {
     return total_pages_;
