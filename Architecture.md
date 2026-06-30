@@ -73,3 +73,6 @@
 12. Shipping
     - As a CLI Wrapped Around it
     - As an External Library
+
+    NOTES:
+    - Header Manager must create header before catalog Manager - 3
