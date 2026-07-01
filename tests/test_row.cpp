@@ -1,3 +1,4 @@
+// g++ -std=c++17 tests/test_row.cpp src/row/serializer.cpp src/catalog/catalog_manager.cpp src/storage/disk_manager.cpp src/storage/header_manager.cpp src/storage/buffer_pool.cpp src/wal/wal_manager.cpp -o tests/test_row && ./tests/test_row
 #include <iostream>
 #include <cassert>
 #include <cmath>

@@ -19,8 +19,8 @@
 
 4. WAL
    - write changes to .wal before applying to .db
-   - checkpoint (flush WAL → .db)
    - crash recovery on startup (replay WAL)
+   - Working: Evert Write is written to .wal file but only transactions with commit block are redone.
    Test: simulate crash mid-transaction, restart, verify data integrity
 
 5. Schema / Catalog
@@ -41,6 +41,8 @@
    - leaf nodes: keys + serialized row data
    - leaf linked list for range scans
    - page splits when a node is full
+   - pages merge when underflow occurs
+   - currently allows sparse nodes. Underflow value may be hard-coded too low.
    Test: insert 1000 rows, search each one, verify correctness
 
 8. Table Layer
