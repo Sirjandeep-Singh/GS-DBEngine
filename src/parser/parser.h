@@ -65,16 +65,16 @@ private:
 
     Statement parse_statement();
 
-    SelectStmt       parse_select();
-    InsertStmt       parse_insert();
-    UpdateStmt       parse_update();
-    DeleteStmt       parse_delete();
-    CreateTableStmt  parse_create_table();
-    DropTableStmt    parse_drop_table();
-    CreateDatabaseStmt parse_create_database();
-    DropDatabaseStmt   parse_drop_database();
-    UseStmt          parse_use();
-    ShowStmt         parse_show();
+    Statement parse_select();
+    Statement parse_insert();
+    Statement parse_update();
+    Statement parse_delete();
+    Statement parse_create_table();
+    Statement parse_drop_table();
+    Statement parse_create_database();
+    Statement parse_drop_database();
+    Statement parse_use();
+    Statement parse_show();
 
     // ---- Clause parsers ----
 

@@ -47,7 +47,6 @@ Token Tokenizer::read_string_literal() {
     size_t start_line = line_;
     size_t start_col  = col_;
     std::string value;
-    //how can c be equal to 2 characters here. flaw
     while (!at_end()) {
         char c = advance();
         if (c == '\'') {
