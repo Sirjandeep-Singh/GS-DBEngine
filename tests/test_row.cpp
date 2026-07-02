@@ -1,4 +1,4 @@
-// g++ -std=c++17 tests/test_row.cpp src/row/serializer.cpp src/catalog/catalog_manager.cpp src/storage/disk_manager.cpp src/storage/header_manager.cpp src/storage/buffer_pool.cpp src/wal/wal_manager.cpp -o tests/test_row && ./tests/test_row
+//g++ -std=c++17 tests/test_table.cpp src/table/table.cpp src/row/serializer.cpp src/btree/btree.cpp src/btree/btree_node.cpp src/catalog/catalog_manager.cpp src/storage/disk_manager.cpp src/storage/header_manager.cpp src/storage/buffer_pool.cpp src/wal/wal_manager.cpp -o tests/test_table && ./tests/test_table
 #include <iostream>
 #include <cassert>
 #include <cmath>
