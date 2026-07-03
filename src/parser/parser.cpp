@@ -317,6 +317,10 @@ ColumnDef Parser::parse_column_def() {
             def.is_nullable    = false;
         } else if (match(TokenType::AUTO_INCREMENT)) {
             def.auto_increment = true;
+        } else if (check(TokenType::NOT) && pos_ + 1 < tokens_.size()
+                   && tokens_[pos_ + 1].type == TokenType::NULL_KW) {
+            advance(); advance();  // consume NOT NULL
+            def.is_nullable = false;
         } else {
             parsing_constraints = false;
         }

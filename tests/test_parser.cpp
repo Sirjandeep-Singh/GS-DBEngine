@@ -359,6 +359,37 @@ void test_create_table_float_column() {
 
     std::cout << "[PASS] CREATE TABLE with FLOAT column\n";
 }
+void test_create_table_not_null() {
+    auto stmt = parse(
+        "CREATE TABLE employees ("
+        "  id INT PRIMARY KEY AUTO_INCREMENT,"
+        "  name VARCHAR(100) NOT NULL,"
+        "  department VARCHAR(50),"
+        "  salary FLOAT NOT NULL"
+        ");");
+    auto& s = std::get<CreateTableStmt>(stmt);
+
+    assert(s.columns.size() == 4);
+
+    // PRIMARY KEY implicitly sets is_nullable = false
+    assert(s.columns[0].is_nullable    == false);
+    assert(s.columns[0].is_primary_key == true);
+
+    // NOT NULL explicitly sets is_nullable = false
+    assert(s.columns[1].name        == "name");
+    assert(s.columns[1].is_nullable == false);
+
+    // no constraint — defaults to nullable
+    assert(s.columns[2].name        == "department");
+    assert(s.columns[2].is_nullable == true);
+
+    // NOT NULL on a FLOAT column
+    assert(s.columns[3].name        == "salary");
+    assert(s.columns[3].is_nullable == false);
+
+    std::cout << "[PASS] CREATE TABLE NOT NULL constraint\n";
+}
+
 
 // ─────────────────────────────────────────────
 // DROP TABLE Tests
@@ -552,6 +583,7 @@ int main() {
     std::cout << "\n=== CREATE TABLE Tests ===\n";
     test_create_table_basic();
     test_create_table_float_column();
+    test_create_table_not_null();
 
     std::cout << "\n=== DROP TABLE Tests ===\n";
     test_drop_table();
