@@ -4,14 +4,14 @@
 #include <memory>
 #include <string>
 
-#include "../storage/disk_manager.h"
-#include "../storage/header_manager.h"
-#include "../storage/buffer_pool.h"
-#include "../wal/wal_manager.h"
-#include "../catalog/catalog_manager.h"
-#include "../executor/executor.h"
-#include "../parser/parser.h"
-#include "../parser/tokenizer.h"
+#include "storage/disk_manager.h"
+#include "storage/header_manager.h"
+#include "storage/buffer_pool.h"
+#include "wal/wal_manager.h"
+#include "catalog/catalog_manager.h"
+#include "executor/executor.h"
+#include "parser/parser.h"
+#include "parser/tokenizer.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Database

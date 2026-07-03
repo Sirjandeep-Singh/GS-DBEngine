@@ -3,8 +3,8 @@
 #include <cstdlib>
 #include <stdexcept>
 
-#include "../parser/tokenizer.h"
-#include "../parser/parser.h"
+#include "parser/tokenizer.h"
+#include "parser/parser.h"
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Construction
