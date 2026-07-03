@@ -47,6 +47,9 @@ public:
     // Ensures data_dir exists on construction.
     explicit Database(std::filesystem::path data_dir = default_data_dir());
 
+    // Calls close_database(): flushes buffer pool and checkpoints the active DB.
+    ~Database();
+
     // Primary entry point for the CLI.
     // Tokenizes and parses sql, then dispatches to execute(Statement).
     QueryResult execute(const std::string& sql);

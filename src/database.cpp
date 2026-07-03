@@ -25,6 +25,11 @@ Database::Database(std::filesystem::path data_dir)
     std::filesystem::create_directories(data_dir_);
 }
 
+Database::~Database()
+{
+    close_database();  // flush buffer pool + clean WAL state on normal shutdown
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Path helpers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -172,6 +177,11 @@ QueryResult Database::handle_use(const UseStmt& stmt)
 {
     const std::string& name = stmt.name;
 
+    // No-op if the requested database is already active.
+    if (name == current_db_name_) {
+        return {true, "", {}, {}, 0};
+    }
+
     if (!std::filesystem::exists(db_dir(name))) {
         return {false, "Database '" + name + "' does not exist"};
     }
@@ -204,6 +214,9 @@ QueryResult Database::handle_show_databases()
             result.rows.push_back({entry.path().filename().string()});
         }
     }
+
+    // Sort alphabetically — directory_iterator order is unspecified.
+    std::sort(result.rows.begin(), result.rows.end());
 
     return result;
 }
