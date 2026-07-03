@@ -16,6 +16,7 @@
 #include <iostream>
 #include <numeric>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include "database.h"
