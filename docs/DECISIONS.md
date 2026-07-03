@@ -39,3 +39,11 @@
 - Keywords case-insensitive, identifiers case-sensitive
 - AND binds tighter than OR
 - PRIMARY KEY implies NOT NULL
+- Only honors one key for order by
+
+## Executor
+- `QueryResult::rows` is `vector<vector<string>>` — executor converts Row values to strings; CLI is a dumb printer
+- JOIN output: merged row, left schema columns first, right schema columns appended
+- JOIN column resolution: two-schema overload — qualified refs validated per table, unqualified refs throw on ambiguity if column exists in both tables
+- RIGHT JOIN: swap outer/inner sides, run unified LEFT JOIN loop body
+- NULLs always sort last in ORDER BY
