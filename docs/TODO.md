@@ -17,7 +17,6 @@
 
 ## Stretch goals
 - [ ] Secondary indexes (CREATE INDEX)
-- [ ] LIKE operator implementation
 - [ ] COUNT(*) aggregate
 - [ ] Free page list (reclaim pages after merge/delete) i am thinking track first free page and last free page and write on free pages the next free page
 - [ ] Multi-statement transactions (BEGIN / COMMIT / ROLLBACK)

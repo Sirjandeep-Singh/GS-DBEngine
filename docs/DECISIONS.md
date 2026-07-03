@@ -47,3 +47,13 @@
 - JOIN column resolution: two-schema overload — qualified refs validated per table, unqualified refs throw on ambiguity if column exists in both tables
 - RIGHT JOIN: swap outer/inner sides, run unified LEFT JOIN loop body
 - NULLs always sort last in ORDER BY
+
+## Database
+- Default data_dir: `~/Documents/GS-DBEngine/` — fixed constant; custom path is a future stretch goal
+- `CREATE DATABASE` does NOT auto-USE; explicit `USE` required
+- Non-DB statement with no active database → `"No database selected"`
+- `DROP DATABASE` on active database deselects it (`current_db_name_` cleared) before directory removal
+- `USE` on already-active database is a no-op (no teardown/rebuild)
+- `~Database()` calls `close_database()` — ensures buffer pool flush and clean WAL state on normal shutdown
+- `SHOW DATABASES` output sorted alphabetically (`directory_iterator` order is unspecified)
+- File layout: `data_dir/<name>/<name>.db` + `data_dir/<name>/<name>.wal`

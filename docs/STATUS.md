@@ -22,13 +22,12 @@
 
 | Layer | Files | Status |
 |-------|-------|--------|
-| Executor | executor/executor.h/cpp | ✅ |
-| Database | database.h/cpp | ⬜ Not started |
-| CLI | cli/main.cpp | ⬜ Not started |
-| Build system | CMakeLists.txt | ⬜ Not started |
+| Executor | executor/executor.h/cpp | test_executor.cpp | ✅ |
+| Database | database.h/cpp | test_database.cpp | ✅ |
+| CLI | cli/main.cpp | — | ⬜ Not started |
+| Build system | CMakeLists.txt | — | ⬜ Not started |
 
 ## Known Issues / Gaps
 - No free page list — orphaned pages after B+ tree merges are not reclaimed
-- No secondary index execution (schema supports it, executor not written yet)
-- Custom Path for Database storage
-
+- No secondary index execution (schema supports it, execution not yet wired up)
+- Custom path for database storage not yet implemented
