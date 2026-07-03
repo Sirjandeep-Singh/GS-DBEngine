@@ -50,7 +50,7 @@ struct Env {
 static Statement parse(const std::string& sql) {
     Tokenizer t(sql);
     Parser    p(t.tokenize());
-    return p.parse_statement();
+    return p.parse();
 }
 
 // Helper: execute a SQL string and return the QueryResult.
