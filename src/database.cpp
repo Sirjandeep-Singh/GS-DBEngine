@@ -1,0 +1,257 @@
+#include "database.h"
+
+#include <cstdlib>
+#include <stdexcept>
+
+#include "../parser/tokenizer.h"
+#include "../parser/parser.h"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Construction
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::filesystem::path Database::default_data_dir()
+{
+    const char* home = std::getenv("HOME");
+    if (!home) {
+        throw std::runtime_error("Database: $HOME is not set, cannot resolve default data_dir");
+    }
+    return std::filesystem::path(home) / "Documents" / "GS-DBEngine";
+}
+
+Database::Database(std::filesystem::path data_dir)
+    : data_dir_(std::move(data_dir))
+{
+    std::filesystem::create_directories(data_dir_);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Path helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::filesystem::path Database::db_dir(const std::string& name) const
+{
+    return data_dir_ / name;
+}
+
+std::filesystem::path Database::db_file(const std::string& name) const
+{
+    return db_dir(name) / (name + ".db");
+}
+
+std::filesystem::path Database::wal_file(const std::string& name) const
+{
+    return db_dir(name) / (name + ".wal");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// execute(string) — tokenize → parse → dispatch
+// ─────────────────────────────────────────────────────────────────────────────
+
+QueryResult Database::execute(const std::string& sql)
+{
+    try {
+        Tokenizer tokenizer(sql);
+        std::vector<Token> tokens = tokenizer.tokenize();
+        Parser parser(std::move(tokens));
+        Statement stmt = parser.parse();
+        return execute(stmt);
+    } catch (const std::exception& e) {
+        return QueryResult{false, e.what()};
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// execute(Statement) — intercept database-level statements, forward the rest
+// ─────────────────────────────────────────────────────────────────────────────
+
+QueryResult Database::execute(const Statement& stmt)
+{
+    // Database-level statements are handled here, regardless of whether a
+    // database is currently active.
+    if (auto* s = std::get_if<CreateDatabaseStmt>(&stmt)) {
+        return handle_create_database(*s);
+    }
+    if (auto* s = std::get_if<DropDatabaseStmt>(&stmt)) {
+        return handle_drop_database(*s);
+    }
+    if (auto* s = std::get_if<UseStmt>(&stmt)) {
+        return handle_use(*s);
+    }
+    if (auto* s = std::get_if<ShowStmt>(&stmt)) {
+        if (s->target == ShowTarget::DATABASES) {
+            return handle_show_databases();
+        }
+        // SHOW TABLES falls through to the active Executor below.
+    }
+
+    // Everything else requires an active database.
+    if (!executor_) {
+        return {false, "No database selected"};
+    }
+
+    try {
+        return executor_->execute(stmt);
+    } catch (const std::exception& e) {
+        return QueryResult{false, e.what()};
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CREATE DATABASE
+// ─────────────────────────────────────────────────────────────────────────────
+
+QueryResult Database::handle_create_database(const CreateDatabaseStmt& stmt)
+{
+    const std::string& name = stmt.name;
+
+    if (std::filesystem::exists(db_dir(name))) {
+        return {false, "Database '" + name + "' already exists"};
+    }
+
+    try {
+        std::filesystem::create_directories(db_dir(name));
+
+        // Bootstrap sequence for a brand new database. This stack is local —
+        // it is torn down at the end of this function without becoming the
+        // active database (CREATE DATABASE does not auto-USE).
+        DiskManager    disk(db_file(name).string());
+        HeaderManager  header(disk);
+        header.init();
+
+        BufferPool     buffer_pool(disk);
+        WALManager     wal(wal_file(name).string(), buffer_pool);
+        CatalogManager catalog(buffer_pool, wal);
+        catalog.load(/*is_new_database=*/true);
+
+        // Flush everything to disk before the stack unwinds.
+        buffer_pool.flush_all();
+    } catch (const std::exception& e) {
+        // Roll back the partially created directory so a failed CREATE
+        // DATABASE doesn't leave a corrupt/half-initialized database behind.
+        std::error_code ec;
+        std::filesystem::remove_all(db_dir(name), ec);
+        return {false, std::string("CREATE DATABASE failed: ") + e.what()};
+    }
+
+    return {true, "", {}, {}, 0};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DROP DATABASE
+// ─────────────────────────────────────────────────────────────────────────────
+
+QueryResult Database::handle_drop_database(const DropDatabaseStmt& stmt)
+{
+    const std::string& name = stmt.name;
+
+    if (!std::filesystem::exists(db_dir(name))) {
+        return {false, "Database '" + name + "' does not exist"};
+    }
+
+    // If the database being dropped is currently active, close it first so
+    // no file handles are left open on the directory we're about to delete.
+    if (current_db_name_ == name) {
+        close_database();
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(db_dir(name), ec);
+    if (ec) {
+        return {false, "DROP DATABASE failed: " + ec.message()};
+    }
+
+    return {true, "", {}, {}, 0};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// USE
+// ─────────────────────────────────────────────────────────────────────────────
+
+QueryResult Database::handle_use(const UseStmt& stmt)
+{
+    const std::string& name = stmt.name;
+
+    if (!std::filesystem::exists(db_dir(name))) {
+        return {false, "Database '" + name + "' does not exist"};
+    }
+
+    close_database();
+
+    try {
+        open_database(name);
+    } catch (const std::exception& e) {
+        // Ensure we don't leave a half-open stack or a stale current_db_name_.
+        close_database();
+        return {false, std::string("USE failed: ") + e.what()};
+    }
+
+    return {true, "", {}, {}, 0};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SHOW DATABASES
+// ─────────────────────────────────────────────────────────────────────────────
+
+QueryResult Database::handle_show_databases()
+{
+    QueryResult result;
+    result.success = true;
+    result.columns = {"Databases"};
+
+    for (const auto& entry : std::filesystem::directory_iterator(data_dir_)) {
+        if (entry.is_directory()) {
+            result.rows.push_back({entry.path().filename().string()});
+        }
+    }
+
+    return result;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Storage stack lifecycle
+// ─────────────────────────────────────────────────────────────────────────────
+
+void Database::open_database(const std::string& name)
+{
+    // Bootstrap sequence for an existing database:
+    //   open disk → buffer pool → wal → recover → header load → catalog load
+    disk_manager_    = std::make_unique<DiskManager>(db_file(name).string());
+    buffer_pool_     = std::make_unique<BufferPool>(*disk_manager_);
+    wal_manager_     = std::make_unique<WALManager>(wal_file(name).string(), *buffer_pool_);
+
+    // Replay any committed-but-not-checkpointed transactions left over from
+    // a prior crash, then checkpoint (flush to .db, truncate .wal).
+    wal_manager_->recover();
+
+    header_manager_  = std::make_unique<HeaderManager>(*disk_manager_);
+    header_manager_->load();
+
+    catalog_manager_ = std::make_unique<CatalogManager>(*buffer_pool_, *wal_manager_);
+    catalog_manager_->load(/*is_new_database=*/false);
+
+    executor_ = std::make_unique<Executor>(*catalog_manager_, *buffer_pool_, *wal_manager_);
+
+    current_db_name_ = name;
+}
+
+void Database::close_database()
+{
+    if (current_db_name_.empty()) {
+        return;  // no-op — nothing is active
+    }
+
+    if (buffer_pool_) {
+        buffer_pool_->flush_all();
+    }
+
+    // Destroy in reverse dependency order.
+    executor_.reset();
+    catalog_manager_.reset();
+    wal_manager_.reset();
+    header_manager_.reset();
+    buffer_pool_.reset();
+    disk_manager_.reset();
+
+    current_db_name_.clear();
+}

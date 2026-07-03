@@ -1,8 +1,6 @@
 # TODO
 
 ## Immediate
-- [x] Write executor.h + executor.cpp
-- [x] Write test_executor.cpp
 - [ ] Write database.h + database.cpp (top-level orchestrator)
 - [ ] Write cli/main.cpp (REPL)
 - [ ] Write CMakeLists.txt
@@ -21,9 +19,9 @@
 - [ ] Secondary indexes (CREATE INDEX)
 - [ ] LIKE operator implementation
 - [ ] COUNT(*) aggregate
-- [ ] Free page list (reclaim pages after merge/delete)
+- [ ] Free page list (reclaim pages after merge/delete) i am thinking track first free page and last free page and write on free pages the next free page
 - [ ] Multi-statement transactions (BEGIN / COMMIT / ROLLBACK)
 - [ ] MVCC
 - [ ] Review Executor
-- Custom Path for Database storage
+- [ ]Custom Path for Database storage
 
