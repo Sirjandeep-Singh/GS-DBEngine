@@ -68,19 +68,24 @@ private:
 
     // Recursively evaluates a WhereExpr tree (AND / OR / NOT / compare)
     // against a single row. Returns true if the row satisfies the expression.
+    // right_schema is non-null for JOIN queries — enables two-schema column resolution.
     bool evaluate_where(const WhereExprPtr& expr,
                         const Row&          row,
-                        const TableSchema&  schema) const;
+                        const TableSchema&  left_schema,
+                        const TableSchema*  right_schema = nullptr) const;
 
     // Evaluates a single CompareExpr leaf node against a row.
     bool evaluate_compare(const CompareExpr& expr,
                           const Row&         row,
-                          const TableSchema& schema) const;
+                          const TableSchema& left_schema,
+                          const TableSchema* right_schema = nullptr) const;
 
     // Returns a Predicate that wraps evaluate_where().
     // If where is nullptr, returns a predicate that always returns true.
+    // right_schema is non-null for JOIN queries.
     Predicate build_predicate(const WhereExprPtr& where,
-                              const TableSchema&  schema) const;
+                              const TableSchema&  schema,
+                              const TableSchema*  right_schema = nullptr) const;
 
     // ── JOIN ─────────────────────────────────────────────────────────────────
 
@@ -108,6 +113,13 @@ private:
     size_t resolve_column(const ColumnRef&   ref,
                           const TableSchema& schema) const;
 
+    // Two-schema overload for JOIN queries.
+    // Qualified refs are checked against the correct table name.
+    // Unqualified refs search both schemas and throw on ambiguity.
+    size_t resolve_column(const ColumnRef&   ref,
+                          const TableSchema& left_schema,
+                          const TableSchema& right_schema) const;
+
     // ── CREATE TABLE helpers ─────────────────────────────────────────────────
 
     // Converts an AST ColumnDef to a catalog Column.
@@ -132,6 +144,5 @@ private:
         const std::vector<SelectColumn>& select_cols,
         const Row&                       row,
         const TableSchema&               schema,
-        const Row*                       joined_row    = nullptr,
         const TableSchema*               joined_schema = nullptr) const;
 };

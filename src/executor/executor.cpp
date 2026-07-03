@@ -314,33 +314,19 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
         std::vector<JoinedRow> joined =
             nested_loop_join(left_results, schema, right_tbl, right_schema, join);
 
-        // Build a merged schema (left columns then right columns) for WHERE
-        // evaluation.  This works correctly for unqualified column references.
-        // Qualified references that use the right table's name will be handled
-        // by the linear search in column_index — they find the unqualified name
-        // at the merged offset.
-        TableSchema merged;
-        merged.name              = schema.name;
-        merged.root_page         = 0;
-        merged.primary_key_index = schema.primary_key_index;
-        merged.columns           = schema.columns;
-        for (const auto& col : right_schema.columns) {
-            merged.columns.push_back(col);
-        }
-
-        // Filter with WHERE on the combined (merged) row
+        // WHERE — two-schema resolve handles qualified right-table references
         std::vector<JoinedRow> filtered;
         filtered.reserve(joined.size());
         for (auto& jr : joined) {
-            if (!stmt.where || evaluate_where(stmt.where, jr.row, merged)) {
+            if (!stmt.where || evaluate_where(stmt.where, jr.row, schema, &right_schema)) {
                 filtered.push_back(std::move(jr));
             }
         }
 
-        // ORDER BY on the merged row
+        // ORDER BY — two-schema resolve
         if (!stmt.order_by.empty()) {
             const OrderByClause& ob = stmt.order_by[0];
-            size_t col_idx = resolve_column(ob.column, merged);
+            size_t col_idx = resolve_column(ob.column, schema, right_schema);
             sort_by_column(filtered, col_idx, ob.ascending,
                            [](const JoinedRow& jr) -> const Row& { return jr.row; });
         }
@@ -354,7 +340,7 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
         result.columns = build_column_headers(stmt.columns, schema, &right_schema);
         for (const auto& jr : filtered) {
             result.rows.push_back(
-                project_row(stmt.columns, jr.row, schema, nullptr, &right_schema));
+                project_row(stmt.columns, jr.row, schema, &right_schema));
         }
     }
 
@@ -533,35 +519,38 @@ QueryResult Executor::execute_use(const UseStmt&) {
 
 bool Executor::evaluate_where(const WhereExprPtr& expr,
                                const Row&          row,
-                               const TableSchema&  schema) const
+                               const TableSchema&  left_schema,
+                               const TableSchema*  right_schema) const
 {
     if (!expr) return true;
 
     if (expr->kind == WhereExpr::Kind::COMPARE) {
-        return evaluate_compare(expr->compare, row, schema);
+        return evaluate_compare(expr->compare, row, left_schema, right_schema);
     }
 
     // LOGICAL node
     switch (expr->logical_op) {
         case LogicalOp::AND:
-            // Short-circuit evaluation
-            return evaluate_where(expr->left,  row, schema) &&
-                   evaluate_where(expr->right, row, schema);
+            return evaluate_where(expr->left,  row, left_schema, right_schema) &&
+                   evaluate_where(expr->right, row, left_schema, right_schema);
         case LogicalOp::OR:
-            return evaluate_where(expr->left,  row, schema) ||
-                   evaluate_where(expr->right, row, schema);
+            return evaluate_where(expr->left,  row, left_schema, right_schema) ||
+                   evaluate_where(expr->right, row, left_schema, right_schema);
         case LogicalOp::NOT:
-            return !evaluate_where(expr->left, row, schema);
+            return !evaluate_where(expr->left, row, left_schema, right_schema);
     }
     return false;
 }
 
 bool Executor::evaluate_compare(const CompareExpr& expr,
                                  const Row&         row,
-                                 const TableSchema& schema) const
+                                 const TableSchema& left_schema,
+                                 const TableSchema* right_schema) const
 {
-    size_t       col_idx = resolve_column(expr.column, schema);
-    const Value& val     = row.get(col_idx);
+    size_t col_idx = right_schema
+        ? resolve_column(expr.column, left_schema, *right_schema)
+        : resolve_column(expr.column, left_schema);
+    const Value& val = row.get(col_idx);
 
     // IS NULL / IS NOT NULL do not examine the operand
     if (expr.op == CompareOp::IS_NULL)     return  is_null(val);
@@ -629,15 +618,16 @@ bool Executor::evaluate_compare(const CompareExpr& expr,
 }
 
 Predicate Executor::build_predicate(const WhereExprPtr& where,
-                                     const TableSchema&  schema) const
+                                     const TableSchema&  schema,
+                                     const TableSchema*  right_schema) const
 {
     if (!where) {
         return [](const Row&) { return true; };
     }
     // Capture by reference — safe because the predicate is only used within
     // the same execute_*() call frame, which keeps 'where' and 'schema' alive.
-    return [this, &where, &schema](const Row& row) {
-        return evaluate_where(where, row, schema);
+    return [this, &where, &schema, right_schema](const Row& row) {
+        return evaluate_where(where, row, schema, right_schema);
     };
 }
 
@@ -661,6 +651,48 @@ size_t Executor::resolve_column(const ColumnRef&   ref,
         throw std::runtime_error("Unknown column '" + ref.column_name + "'");
     }
     return static_cast<size_t>(idx);
+}
+
+size_t Executor::resolve_column(const ColumnRef&   ref,
+                                 const TableSchema& left_schema,
+                                 const TableSchema& right_schema) const
+{
+    const size_t left_width = left_schema.columns.size();
+
+    if (!ref.table_name.empty()) {
+        // Qualified reference — must match exactly one table's name
+        if (ref.table_name == left_schema.name) {
+            int idx = left_schema.column_index(ref.column_name);
+            if (idx < 0)
+                throw std::runtime_error("Unknown column '" + ref.column_name +
+                                         "' in table '" + left_schema.name + "'");
+            return static_cast<size_t>(idx);
+        }
+        if (ref.table_name == right_schema.name) {
+            int idx = right_schema.column_index(ref.column_name);
+            if (idx < 0)
+                throw std::runtime_error("Unknown column '" + ref.column_name +
+                                         "' in table '" + right_schema.name + "'");
+            return left_width + static_cast<size_t>(idx);
+        }
+        throw std::runtime_error("Unknown table '" + ref.table_name + "'");
+    }
+
+    // Unqualified — search both; throw on ambiguity
+    int left_idx  = left_schema.column_index(ref.column_name);
+    int right_idx = right_schema.column_index(ref.column_name);
+
+    if (left_idx >= 0 && right_idx >= 0) {
+        throw std::runtime_error(
+            "Ambiguous column '" + ref.column_name +
+            "' exists in both '" + left_schema.name +
+            "' and '" + right_schema.name +
+            "' — qualify with table name");
+    }
+    if (left_idx  >= 0) return static_cast<size_t>(left_idx);
+    if (right_idx >= 0) return left_width + static_cast<size_t>(right_idx);
+
+    throw std::runtime_error("Unknown column '" + ref.column_name + "'");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -713,7 +745,6 @@ std::vector<std::string> Executor::project_row(
     const std::vector<SelectColumn>& select_cols,
     const Row&                       row,
     const TableSchema&               schema,
-    const Row*                       /*joined_row*/,
     const TableSchema*               joined_schema) const
 {
     // For JOIN queries, 'row' is the combined row (left cols + right cols).
