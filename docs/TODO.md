@@ -1,20 +1,21 @@
 # TODO
 
 ## Immediate
-- [ ] Write executor.h + executor.cpp
-- [ ] Write test_executor.cpp
+- [x] Write executor.h + executor.cpp
+- [x] Write test_executor.cpp
 - [ ] Write database.h + database.cpp (top-level orchestrator)
 - [ ] Write cli/main.cpp (REPL)
 - [ ] Write CMakeLists.txt
 
-## Executor tasks
-- [ ] SELECT — scan/filter, JOIN (nested loop), ORDER BY, LIMIT
-- [ ] INSERT — parse values, map to schema columns, call Table::insert
-- [ ] UPDATE — find rows via predicate, call Table::update_where
-- [ ] DELETE — find rows via predicate, call Table::delete_where
-- [ ] CREATE TABLE — validate schema, call CatalogManager::create_table + allocate B+ tree root
-- [ ] DROP TABLE — call CatalogManager::drop_table
-- [ ] CREATE DATABASE / DROP DATABASE / USE / SHOW
+## Database tasks
+- [ ] CREATE DATABASE — create `~/Documents/GS-DBEngine/<name>/` directory, init .db + .wal
+- [ ] DROP DATABASE — delete directory and all contents
+- [ ] USE — close current storage stack, open stack for named database
+- [ ] SHOW DATABASES — list subdirectories in data_dir
+- [ ] Guard: non-DB statement with no active database → "No database selected"
+- [ ] execute(string) overload — parse then dispatch to execute(Statement)
+- [ ] CREATE DATABASE does NOT auto-USE; explicit USE required
+- [ ] Default data_dir: `~/Documents/GS-DBEngine/` — fixed constant, no runtime path change
 
 ## Stretch goals
 - [ ] Secondary indexes (CREATE INDEX)
@@ -23,3 +24,6 @@
 - [ ] Free page list (reclaim pages after merge/delete)
 - [ ] Multi-statement transactions (BEGIN / COMMIT / ROLLBACK)
 - [ ] MVCC
+- [ ] Review Executor
+- Custom Path for Database storage
+
