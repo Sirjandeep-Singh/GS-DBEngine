@@ -1,0 +1,8 @@
+@PACKAGE_INIT@
+
+# Pulls in the exported gsdb_lib target (as GSDBEngine::gsdb_lib), including
+# its include directories and compile requirements — this is what lets a
+# consumer skip manual -I/-L/-l flags entirely.
+include("${CMAKE_CURRENT_LIST_DIR}/GSDBEngineTargets.cmake")
+
+check_required_components(GSDBEngine)
