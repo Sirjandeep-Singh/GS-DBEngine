@@ -17,15 +17,21 @@
 | Table | table/table.h/cpp | test_table.cpp | ✅ |
 | Tokenizer | parser/tokenizer.h/cpp | test_tokenizer.cpp | ✅ |
 | Parser + AST | parser/parser.h/cpp + ast.h | test_parser.cpp | ✅ |
-
-## Layers Remaining
-
-| Layer | Files | Status |
-|-------|-------|--------|
 | Executor | executor/executor.h/cpp | test_executor.cpp | ✅ |
 | Database | database.h/cpp | test_database.cpp | ✅ |
-| CLI | cli/main.cpp | — | ⬜ Not started |
-| Build system | CMakeLists.txt | — | ⬜ Not started |
+| CLI | cli/main.cpp | manual REPL testing | ✅ |
+| Build system | CMakeLists.txt | `cmake -B build && cmake --build build` | ✅ |
+
+## Packaging / Distribution
+
+| Item | Mechanism | Status |
+|------|-----------|--------|
+| CLI install | `install(TARGETS gsdb RUNTIME DESTINATION bin)` → `sudo cmake --install build` puts `gsdb` on PATH | ✅ |
+| Library + headers install | `install(TARGETS gsdb_lib ...)` + `install(DIRECTORY src/ ...)` → `/usr/local/lib`, `/usr/local/include/gsdb` | ✅ |
+| CMake package config | `GSDBEngineConfig.cmake` + `GSDBEngineTargets.cmake` → consumers use `find_package(GSDBEngine)` | ✅ |
+| End-to-end consumer validation | Standalone external test project (`find_package` + `target_link_libraries`, zero manual `-I`/`-L`/`-l`) — built, linked, and ran real SQL successfully | ✅ |
+| pkg-config (.pc) support | For plain-g++ consumers without CMake | ⬜ Not started (stretch) |
+| README.md | End-user build/install/usage instructions | ⬜ Not started |
 
 ## Known Issues / Gaps
 - No free page list — orphaned pages after B+ tree merges are not reclaimed
