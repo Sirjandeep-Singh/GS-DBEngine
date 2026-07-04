@@ -1,0 +1,53 @@
+# ── Build output ─────────────────────────────────────────────────────────
+build/
+out/
+cmake-build-*/
+
+# CMake-generated files (in case of in-source or stray configure)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+Makefile
+compile_commands.json
+_deps/
+
+# ── Compiled binaries / object files ────────────────────────────────────
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# Test + CLI executables (extensionless on Linux)
+gsdb
+test_storage
+test_wal
+test_catalog
+test_btree_node
+test_btree
+test_row
+test_table
+test_tokenizer
+test_parser
+test_executor
+test_database
+
+# ── Runtime database files ──────────────────────────────────────────────
+*.db
+*.wal
+databases/
+
+# ── Editor / IDE ─────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+
+# ── OS cruft ─────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
