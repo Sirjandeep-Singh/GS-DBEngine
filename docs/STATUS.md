@@ -36,4 +36,3 @@
 ## Known Issues / Gaps
 - No free page list — orphaned pages after B+ tree merges are not reclaimed
 - No secondary index execution (schema supports it, execution not yet wired up)
-- Custom path for database storage not yet implemented
