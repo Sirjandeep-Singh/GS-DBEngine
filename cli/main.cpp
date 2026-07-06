@@ -131,6 +131,60 @@ static bool is_quit(const std::string& line)
     return (lower == "exit" || lower == "quit" || lower == "\\q");
 }
 
+// Handles the "\path" meta-command, if 'line' is one.
+//   \path             — print the current data directory
+//   \path <dir>       — change the data directory to <dir> (persists across
+//                        sessions; closes any active database first)
+//   \path default     — reset to the default data directory (also persists)
+// Returns true if 'line' was a \path command (handled, whether it succeeded
+// or errored) — false if 'line' isn't a \path command at all, so the caller
+// should fall through to normal SQL buffering.
+static bool try_handle_path_command(const std::string& line, Database& db)
+{
+    std::string trimmed = line;
+    size_t s = trimmed.find_first_not_of(" \t\r\n");
+    if (s == std::string::npos) return false;
+    trimmed = trimmed.substr(s);
+
+    if (trimmed.rfind("\\path", 0) != 0) return false;  // doesn't start with \path
+
+    std::string rest = trimmed.substr(5);
+    size_t rs = rest.find_first_not_of(" \t\r\n");
+
+    if (rs == std::string::npos) {
+        // No argument — just show the current data directory.
+        std::cout << "Current data directory: " << db.data_dir().string() << "\n";
+        return true;
+    }
+
+    rest = rest.substr(rs);
+    size_t re = rest.find_last_not_of(" \t\r\n");
+    rest = rest.substr(0, re + 1);
+
+    std::string lower = rest;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+    std::string previous_db = db.current_database();
+
+    try {
+        if (lower == "default") {
+            db.reset_data_dir();
+            std::cout << "Data directory reset to default: " << db.data_dir().string() << "\n";
+        } else {
+            db.set_data_dir(rest);
+            std::cout << "Data directory changed to: " << db.data_dir().string() << "\n";
+        }
+        if (!previous_db.empty()) {
+            std::cout << "(previously active database '" << previous_db << "' was closed — "
+                       << "run USE again if you need it)\n";
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "ERROR: " << e.what() << "\n";
+    }
+
+    return true;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────────────────────────────
@@ -144,7 +198,9 @@ int main()
     if (interactive) {
         std::cout << "GS-DBEngine v0.1\n"
                   << "Type SQL statements terminated with ';'.\n"
-                  << "Type 'exit' or 'quit' to leave.\n\n";
+                  << "Type 'exit' or 'quit' to leave.\n"
+                  << "Type '\\path' to see/change the data directory.\n"
+                  << "Data directory: " << db.data_dir().string() << "\n\n";
     }
 
     std::string buffer;  // accumulated SQL (may span multiple lines)
@@ -177,6 +233,14 @@ int main()
         if (buffer.empty() && is_quit(line)) {
             if (interactive) std::cout << "Bye.\n";
             break;
+        }
+
+        // \path is a REPL meta-command, not SQL — handle it directly and
+        // skip SQL buffering entirely. Only recognized when not already
+        // mid-statement (buffer.empty()), same as is_quit() above.
+        if (buffer.empty() && try_handle_path_command(line, db)) {
+            if (interactive) std::cout << '\n';
+            continue;
         }
 
         // Accumulate the line (preserve newlines for multi-line SQL)

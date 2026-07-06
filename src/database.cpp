@@ -1,6 +1,7 @@
 #include "database.h"
 
 #include <cstdlib>
+#include <fstream>
 #include <stdexcept>
 
 #include "parser/tokenizer.h"
@@ -19,6 +20,43 @@ std::filesystem::path Database::default_data_dir()
     return std::filesystem::path(home) / "Documents" / "GS-DBEngine";
 }
 
+std::filesystem::path Database::config_file_path()
+{
+    const char* home = std::getenv("HOME");
+    if (!home) {
+        throw std::runtime_error("Database: $HOME is not set, cannot resolve config file path");
+    }
+    return std::filesystem::path(home) / "Documents" / "GSDB-config.txt";
+}
+
+std::filesystem::path Database::resolve_data_dir()
+{
+    std::error_code ec;
+    std::filesystem::path cfg = config_file_path();
+    if (!std::filesystem::exists(cfg, ec) || ec) {
+        return default_data_dir();
+    }
+
+    std::ifstream in(cfg);
+    std::string line;
+    if (std::getline(in, line) && !line.empty()) {
+        return std::filesystem::path(line);
+    }
+    return default_data_dir();
+}
+
+void Database::persist_data_dir(const std::filesystem::path& dir)
+{
+    std::filesystem::path cfg = config_file_path();
+    std::filesystem::create_directories(cfg.parent_path());
+
+    std::ofstream out(cfg, std::ios::trunc);
+    if (!out) {
+        throw std::runtime_error("Database: failed to write " + cfg.string());
+    }
+    out << dir.string() << "\n";
+}
+
 Database::Database(std::filesystem::path data_dir)
     : data_dir_(std::move(data_dir))
 {
@@ -28,6 +66,44 @@ Database::Database(std::filesystem::path data_dir)
 Database::~Database()
 {
     close_database();  // flush buffer pool + clean WAL state on normal shutdown
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Data directory management
+// ─────────────────────────────────────────────────────────────────────────────
+
+void Database::set_data_dir(std::filesystem::path new_dir)
+{
+    // Close whatever's active first — the old storage stack (open file
+    // handles, buffer pool contents) belongs to the *old* data_dir and is
+    // meaningless once we point at a new one. close_database() is already
+    // a safe no-op if nothing is active.
+    close_database();
+
+    // Create the new directory if it doesn't exist yet. Throws on failure
+    // (e.g. permission denied) — data_dir_ is left unchanged in that case,
+    // since we haven't reassigned it yet.
+    std::filesystem::create_directories(new_dir);
+
+    data_dir_ = std::move(new_dir);
+
+    // Persist so this survives future sessions.
+    persist_data_dir(data_dir_);
+}
+
+void Database::reset_data_dir()
+{
+    close_database();
+
+    data_dir_ = default_data_dir();
+    std::filesystem::create_directories(data_dir_);
+
+    // Remove the override file entirely, rather than persisting the default
+    // path into it — this way, if default_data_dir()'s resolution logic ever
+    // changes (e.g. a different $HOME), a fresh session still picks that up
+    // instead of reading a now-stale literal path.
+    std::error_code ec;
+    std::filesystem::remove(config_file_path(), ec);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
