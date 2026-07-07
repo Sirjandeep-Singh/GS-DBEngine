@@ -1,5 +1,4 @@
-// # WAL tests
-// g++ -std=c++17 tests/test_wal.cpp src/storage/disk_manager.cpp src/storage/header_manager.cpp src/storage/buffer_pool.cpp src/wal/wal_manager.cpp -o tests/test_wal && ./tests/test_wal
+// g++ -std=c++17 tests/test_storage.cpp src/storage/disk_manager.cpp src/storage/header_manager.cpp src/storage/buffer_pool.cpp -o tests/test_storage && ./tests/test_storage
 #include <iostream>
 #include <cassert>
 #include <cstring>
