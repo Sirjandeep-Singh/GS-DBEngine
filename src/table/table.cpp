@@ -3,8 +3,8 @@
 #include <stdexcept>
 #include "../row/serializer.h"
 
-Table::Table(const TableSchema& schema, BufferPool& buffer_pool, WALManager& wal)
-    : schema_(schema), btree_(buffer_pool, wal, schema.root_page), next_auto_increment_(1)
+Table::Table(const TableSchema& schema, BufferPool& buffer_pool, WALManager& wal, FreeListManager& free_list)
+    : schema_(schema), btree_(buffer_pool, wal, free_list, schema.root_page), next_auto_increment_(1)
 {
     init_auto_increment();
 }

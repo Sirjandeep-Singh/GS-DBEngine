@@ -1,13 +1,14 @@
-// g++ -std=c++17 tests/test_executor.cpp src/executor/executor.cpp src/parser/parser.cpp src/parser/tokenizer.cpp src/table/table.cpp src/row/serializer.cpp src/btree/btree.cpp src/btree/btree_node.cpp src/catalog/catalog_manager.cpp src/storage/disk_manager.cpp src/storage/header_manager.cpp src/storage/buffer_pool.cpp src/wal/wal_manager.cpp -o tests/test_executor && ./tests/test_executor
+// g++ -std=c++17 tests/test_executor.cpp src/executor/executor.cpp src/parser/parser.cpp src/parser/tokenizer.cpp src/table/table.cpp src/row/serializer.cpp src/btree/btree.cpp src/btree/btree_node.cpp src/btree/free_list_manager.cpp src/catalog/catalog_manager.cpp src/storage/disk_manager.cpp src/header/header_manager.cpp src/storage/buffer_pool.cpp src/wal/wal_manager.cpp -o tests/test_executor && ./tests/test_executor
 
 #include <iostream>
 #include <cassert>
 #include <filesystem>
 
 #include "../src/storage/disk_manager.h"
-#include "../src/storage/header_manager.h"
+#include "../src/header/header_manager.h"
 #include "../src/storage/buffer_pool.h"
 #include "../src/wal/wal_manager.h"
+#include "../src/btree/free_list_manager.h"
 #include "../src/catalog/catalog_manager.h"
 #include "../src/parser/parser.h"
 #include "../src/parser/tokenizer.h"
@@ -26,20 +27,22 @@ void cleanup() {
 // Full stack environment — mirrors the Database class bootstrap sequence
 // for a brand-new database (from AGENT.md Layer 9).
 struct Env {
-    DiskManager    dm;
-    HeaderManager  hm;
-    BufferPool     bp;
-    WALManager     wal;
-    CatalogManager cat;
-    Executor       exec;
+    DiskManager      dm;
+    BufferPool       bp;
+    WALManager       wal;
+    HeaderManager    hm;
+    FreeListManager  fl;
+    CatalogManager   cat;
+    Executor         exec;
 
     Env()
         : dm(DB_FILE)
-        , hm(dm)
         , bp(dm)
         , wal(WAL_FILE, bp)
+        , hm(bp, wal)
+        , fl(bp, wal, hm)
         , cat(bp, wal)
-        , exec(cat, bp, wal)
+        , exec(cat, bp, wal, fl)
     {
         hm.init();             // allocates page 0
         cat.load(true);        // allocates page 1
@@ -537,15 +540,16 @@ void test_data_survives_restart() {
 
     // Reopen — mirrors existing database bootstrap sequence from AGENT.md
     {
-        DiskManager    dm(DB_FILE);
-        BufferPool     bp(dm);
-        WALManager     wal(WAL_FILE, bp);
+        DiskManager     dm(DB_FILE);
+        BufferPool      bp(dm);
+        WALManager      wal(WAL_FILE, bp);
         wal.recover();
-        HeaderManager  hm(dm);
+        HeaderManager   hm(bp, wal);
         hm.load();
-        CatalogManager cat(bp, wal);
+        FreeListManager fl(bp, wal, hm);
+        CatalogManager  cat(bp, wal);
         cat.load(false);
-        Executor exec(cat, bp, wal);
+        Executor exec(cat, bp, wal, fl);
 
         auto r = exec.execute(parse("SELECT * FROM users;"));
         assert(r.success);

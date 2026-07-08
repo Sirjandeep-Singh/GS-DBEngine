@@ -9,6 +9,7 @@
 #include "../catalog/schema.h"
 #include "../row/row.h"
 #include "../btree/btree.h"
+#include "../btree/free_list_manager.h"
 #include "../storage/buffer_pool.h"
 #include "../wal/wal_manager.h"
 
@@ -44,8 +45,8 @@ class Table {
 public:
     // schema    : the table's column definitions — owned by CatalogManager,
     //             Table holds a const reference and does not copy it
-    // buffer_pool, wal : passed through to BTree
-    Table(const TableSchema& schema, BufferPool& buffer_pool, WALManager& wal);
+    // buffer_pool, wal, free_list : passed through to BTree
+    Table(const TableSchema& schema, BufferPool& buffer_pool, WALManager& wal, FreeListManager& free_list);
 
     // returns the current root page_id of the underlying B+ tree.
     // the caller (executor/database class) must persist this via

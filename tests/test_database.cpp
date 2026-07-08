@@ -1,8 +1,9 @@
 // g++ -std=c++17 tests/test_database.cpp src/database.cpp src/executor/executor.cpp \
 //     src/parser/parser.cpp src/parser/tokenizer.cpp src/table/table.cpp \
 //     src/row/serializer.cpp src/btree/btree.cpp src/btree/btree_node.cpp \
+//     src/btree/free_list_manager.cpp \
 //     src/catalog/catalog_manager.cpp src/storage/disk_manager.cpp \
-//     src/storage/header_manager.cpp src/storage/buffer_pool.cpp \
+//     src/header/header_manager.cpp src/storage/buffer_pool.cpp \
 //     src/wal/wal_manager.cpp -o tests/test_database && ./tests/test_database
 
 #include <iostream>

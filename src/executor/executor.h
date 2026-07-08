@@ -9,6 +9,7 @@
 #include "../catalog/schema.h"
 #include "../storage/buffer_pool.h"
 #include "../wal/wal_manager.h"
+#include "../btree/free_list_manager.h"
 #include "../table/table.h"
 #include "../row/row.h"
 
@@ -38,16 +39,17 @@ struct QueryResult {
 
 class Executor {
 public:
-    // catalog, buffer_pool, and wal must outlive the Executor.
-    Executor(CatalogManager& catalog, BufferPool& buffer_pool, WALManager& wal);
+    // catalog, buffer_pool, wal, and free_list must outlive the Executor.
+    Executor(CatalogManager& catalog, BufferPool& buffer_pool, WALManager& wal, FreeListManager& free_list);
 
     // Execute any parsed Statement. Never throws.
     QueryResult execute(const Statement& stmt);
 
 private:
-    CatalogManager& catalog_;
-    BufferPool&     buffer_pool_;
-    WALManager&     wal_;
+    CatalogManager&   catalog_;
+    BufferPool&       buffer_pool_;
+    WALManager&       wal_;
+    FreeListManager&  free_list_;
 
     // ── Statement handlers ───────────────────────────────────────────────────
 

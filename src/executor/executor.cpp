@@ -41,8 +41,9 @@ static bool like_match(const std::string& text,
 
 Executor::Executor(CatalogManager& catalog,
                    BufferPool&     buffer_pool,
-                   WALManager&     wal)
-    : catalog_(catalog), buffer_pool_(buffer_pool), wal_(wal) {}
+                   WALManager&     wal,
+                   FreeListManager& free_list)
+    : catalog_(catalog), buffer_pool_(buffer_pool), wal_(wal), free_list_(free_list) {}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // execute() — top-level dispatch, never throws
@@ -120,7 +121,7 @@ QueryResult Executor::execute_create_table(const CreateTableStmt& stmt)
 
     // Constructing Table triggers BTree construction which allocates the
     // root leaf page via WAL when root_page == INVALID_PAGE.
-    Table tbl(catalog_.get_table(stmt.table_name), buffer_pool_, wal_);
+    Table tbl(catalog_.get_table(stmt.table_name), buffer_pool_, wal_, free_list_);
 
     // Persist the newly allocated root page back into the catalog.
     catalog_.update_table_root(stmt.table_name, tbl.root_page());
@@ -213,7 +214,7 @@ QueryResult Executor::execute_insert(const InsertStmt& stmt)
         }
     }
 
-    Table tbl(schema, buffer_pool_, wal_);
+    Table tbl(schema, buffer_pool_, wal_, free_list_);
     tbl.insert(row);  // throws on NOT NULL / duplicate PK / type mismatch
 
     // B+ tree root may have changed after a root split — keep catalog in sync
@@ -231,7 +232,7 @@ QueryResult Executor::execute_insert(const InsertStmt& stmt)
 QueryResult Executor::execute_select(const SelectStmt& stmt)
 {
     const TableSchema& schema = catalog_.get_table(stmt.table_name);
-    Table left_tbl(schema, buffer_pool_, wal_);
+    Table left_tbl(schema, buffer_pool_, wal_, free_list_);
 
     QueryResult result;
     result.success = true;
@@ -305,7 +306,7 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
         // ── JOIN path — one join clause, nested-loop ──────────────────────────
         const JoinClause&  join         = stmt.joins[0];
         const TableSchema& right_schema = catalog_.get_table(join.table_name);
-        Table              right_tbl(right_schema, buffer_pool_, wal_);
+        Table              right_tbl(right_schema, buffer_pool_, wal_, free_list_);
 
         // Scan the left table completely first — WHERE is applied after joining
         Predicate all_rows = [](const Row&) { return true; };
@@ -449,7 +450,7 @@ QueryResult Executor::execute_update(const UpdateStmt& stmt)
         new_values.emplace_back(static_cast<size_t>(idx), asgn.value);
     }
 
-    Table     tbl(schema, buffer_pool_, wal_);
+    Table     tbl(schema, buffer_pool_, wal_, free_list_);
     Predicate pred  = build_predicate(stmt.where, schema);
     uint32_t  count = tbl.update_where(pred, new_values);
 
@@ -468,7 +469,7 @@ QueryResult Executor::execute_delete(const DeleteStmt& stmt)
 {
     const TableSchema& schema = catalog_.get_table(stmt.table_name);
 
-    Table     tbl(schema, buffer_pool_, wal_);
+    Table     tbl(schema, buffer_pool_, wal_, free_list_);
     Predicate pred  = build_predicate(stmt.where, schema);
     uint32_t  count = tbl.delete_where(pred);
 

@@ -1,4 +1,4 @@
-//g++ -std=c++17 tests/test_table.cpp src/row/serializer.cpp src/row/serializer.cpp src/catalog/catalog_manager.cpp src/storage/disk_manager.cpp src/storage/header_manager.cpp src/storage/buffer_pool.cpp src/wal/wal_manager.cpp -o tests/test_table && ./tests/test_table
+//g++ -std=c++17 tests/test_table.cpp src/row/serializer.cpp src/catalog/catalog_manager.cpp src/storage/disk_manager.cpp src/header/header_manager.cpp src/storage/buffer_pool.cpp src/wal/wal_manager.cpp src/btree/btree.cpp src/btree/btree_node.cpp src/btree/free_list_manager.cpp src/table/table.cpp -o tests/test_table && ./tests/test_table
 #include <iostream>
 #include <cassert>
 #include <filesystem>
@@ -6,6 +6,8 @@
 #include "../src/storage/disk_manager.h"
 #include "../src/storage/buffer_pool.h"
 #include "../src/wal/wal_manager.h"
+#include "../src/header/header_manager.h"
+#include "../src/btree/free_list_manager.h"
 #include "../src/catalog/schema.h"
 #include "../src/row/row.h"
 #include "../src/table/table.h"
@@ -51,15 +53,26 @@ TableSchema make_users_schema(uint32_t root_page = INVALID_PAGE) {
     return schema;
 }
 
-// helper — makes a setup with DiskManager, BufferPool, WALManager
+// helper — makes a setup with DiskManager, BufferPool, WALManager, HeaderManager, FreeListManager
 struct Env {
-    DiskManager dm;
-    BufferPool  bp;
-    WALManager  wal;
+    DiskManager      dm;
+    BufferPool       bp;
+    WALManager       wal;
+    HeaderManager    hm;
+    FreeListManager  fl;
 
-    Env() : dm(DB_FILE), bp(dm), wal(WAL_FILE, bp) {
-        dm.allocate_page();   // page 0 — header
-        dm.allocate_page();   // page 1 — catalog (not used here but keeps page numbering consistent)
+    // reopen=false (default): fresh database — hm.init() allocates page 0.
+    // reopen=true: reopening an existing DB_FILE — recovers the WAL then
+    // loads the existing header instead of re-initializing it.
+    explicit Env(bool reopen = false) : dm(DB_FILE), bp(dm), wal(WAL_FILE, bp), hm(bp, wal), fl(bp, wal, hm) {
+        if (reopen) {
+            wal.recover();
+            hm.load();
+        } else {
+            hm.init();          // allocates page 0 — header (also sets first_free_page = NO_FREE_PAGE, required by FreeListManager)
+            uint32_t placeholder_id;
+            bp.new_page(placeholder_id);   // page 1 — catalog (not used here but keeps page numbering consistent)
+        }
     }
 };
 
@@ -84,7 +97,7 @@ void test_insert_explicit_key() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     Row row = make_user(1, "Alice", 25, true);
     uint32_t key = table.insert(row);
@@ -98,7 +111,7 @@ void test_insert_auto_increment() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     Row r1 = make_user_null_id("Alice", 25, true);
     Row r2 = make_user_null_id("Bob", 30, false);
@@ -120,7 +133,7 @@ void test_insert_duplicate_key_throws() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     Row r1 = make_user(5, "Alice", 25, true);
     table.insert(r1);
@@ -146,7 +159,7 @@ void test_select_by_key_found() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     Row row = make_user(1, "Alice", 25, true);
     table.insert(row);
@@ -165,7 +178,7 @@ void test_select_by_key_not_found() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     auto result = table.select_by_key(999);
     assert(!result.has_value());
@@ -178,7 +191,7 @@ void test_scan_all_rows() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     Row r1 = make_user(1, "Alice", 25, true);
     Row r2 = make_user(2, "Bob",   30, false);
@@ -201,7 +214,7 @@ void test_scan_with_predicate() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     table.insert(make_user(1, "Alice", 25, true));
     table.insert(make_user(2, "Bob",   30, false));
@@ -226,7 +239,7 @@ void test_scan_with_null_column() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     Row r1 = make_user(1, "Alice", 25, true);
     Row r2;
@@ -250,7 +263,7 @@ void test_update_single_column() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     table.insert(make_user(1, "Alice", 25, true));
 
@@ -270,7 +283,7 @@ void test_update_multiple_columns() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     table.insert(make_user(1, "Alice", 25, true));
 
@@ -293,7 +306,7 @@ void test_update_nonexistent_key_throws() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     bool threw = false;
     try {
@@ -311,7 +324,7 @@ void test_update_primary_key_throws() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     table.insert(make_user(1, "Alice", 25, true));
 
@@ -335,7 +348,7 @@ void test_delete_row() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     table.insert(make_user(1, "Alice", 25, true));
     assert(table.select_by_key(1).has_value());
@@ -351,7 +364,7 @@ void test_delete_nonexistent_key_throws() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     bool threw = false;
     try {
@@ -369,7 +382,7 @@ void test_delete_where() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     table.insert(make_user(1, "Alice", 25, true));
     table.insert(make_user(2, "Bob",   30, false));
@@ -395,7 +408,7 @@ void test_update_where() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     table.insert(make_user(1, "Alice", 25, true));
     table.insert(make_user(2, "Bob",   30, false));
@@ -431,17 +444,16 @@ void test_auto_increment_continues_after_reopen() {
     {
         Env env;
         TableSchema schema = make_users_schema();
-        Table table(schema, env.bp, env.wal);
+        Table table(schema, env.bp, env.wal, env.fl);
 
         table.insert(make_user_null_id("Alice", 25, true));   // key=1
         table.insert(make_user_null_id("Bob",   30, false));  // key=2
         root = table.root_page();
     }
 
-    Env env2;
-    env2.wal.recover();
+    Env env2(/*reopen=*/true);
     TableSchema schema2 = make_users_schema(root);
-    Table table2(schema2, env2.bp, env2.wal);
+    Table table2(schema2, env2.bp, env2.wal, env2.fl);
 
     // should continue from 3, not restart at 1
     Row r = make_user_null_id("Carol", 22, true);
@@ -460,7 +472,7 @@ void test_insert_and_scan_many_rows() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
-    Table table(schema, env.bp, env.wal);
+    Table table(schema, env.bp, env.wal, env.fl);
 
     const uint32_t N = 500;
     for (uint32_t i = 1; i <= N; i++) {

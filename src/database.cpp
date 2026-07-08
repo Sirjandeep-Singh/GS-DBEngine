@@ -197,11 +197,12 @@ QueryResult Database::handle_create_database(const CreateDatabaseStmt& stmt)
         // it is torn down at the end of this function without becoming the
         // active database (CREATE DATABASE does not auto-USE).
         DiskManager    disk(db_file(name).string());
-        HeaderManager  header(disk);
-        header.init();
-
         BufferPool     buffer_pool(disk);
         WALManager     wal(wal_file(name).string(), buffer_pool);
+
+        HeaderManager  header(buffer_pool, wal);
+        header.init();
+
         CatalogManager catalog(buffer_pool, wal);
         catalog.load(/*is_new_database=*/true);
 
@@ -304,7 +305,7 @@ QueryResult Database::handle_show_databases()
 void Database::open_database(const std::string& name)
 {
     // Bootstrap sequence for an existing database:
-    //   open disk → buffer pool → wal → recover → header load → catalog load
+    //   open disk → buffer pool → wal → recover → header load → free list → catalog load
     disk_manager_    = std::make_unique<DiskManager>(db_file(name).string());
     buffer_pool_     = std::make_unique<BufferPool>(*disk_manager_);
     wal_manager_     = std::make_unique<WALManager>(wal_file(name).string(), *buffer_pool_);
@@ -313,13 +314,15 @@ void Database::open_database(const std::string& name)
     // a prior crash, then checkpoint (flush to .db, truncate .wal).
     wal_manager_->recover();
 
-    header_manager_  = std::make_unique<HeaderManager>(*disk_manager_);
+    header_manager_  = std::make_unique<HeaderManager>(*buffer_pool_, *wal_manager_);
     header_manager_->load();
+
+    free_list_manager_ = std::make_unique<FreeListManager>(*buffer_pool_, *wal_manager_, *header_manager_);
 
     catalog_manager_ = std::make_unique<CatalogManager>(*buffer_pool_, *wal_manager_);
     catalog_manager_->load(/*is_new_database=*/false);
 
-    executor_ = std::make_unique<Executor>(*catalog_manager_, *buffer_pool_, *wal_manager_);
+    executor_ = std::make_unique<Executor>(*catalog_manager_, *buffer_pool_, *wal_manager_, *free_list_manager_);
 
     current_db_name_ = name;
 }
@@ -337,6 +340,7 @@ void Database::close_database()
     // Destroy in reverse dependency order.
     executor_.reset();
     catalog_manager_.reset();
+    free_list_manager_.reset();
     wal_manager_.reset();
     header_manager_.reset();
     buffer_pool_.reset();

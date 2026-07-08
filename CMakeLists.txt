@@ -16,12 +16,13 @@ endif()
 # ── Core static library (everything except cli/ and tests/) ────────────────
 add_library(gsdb_lib STATIC
     src/storage/disk_manager.cpp
-    src/storage/header_manager.cpp
+    src/header/header_manager.cpp
     src/storage/buffer_pool.cpp
     src/wal/wal_manager.cpp
     src/catalog/catalog_manager.cpp
     src/btree/btree_node.cpp
     src/btree/btree.cpp
+    src/btree/free_list_manager.cpp
     src/row/serializer.cpp
     src/table/table.cpp
     src/parser/tokenizer.cpp

@@ -5,9 +5,10 @@
 #include <string>
 
 #include "storage/disk_manager.h"
-#include "storage/header_manager.h"
+#include "header/header_manager.h"
 #include "storage/buffer_pool.h"
 #include "wal/wal_manager.h"
+#include "btree/free_list_manager.h"
 #include "catalog/catalog_manager.h"
 #include "executor/executor.h"
 #include "parser/parser.h"
@@ -116,12 +117,13 @@ private:
 
     // Storage stack for the currently active database.
     // All pointers are null when no database is selected.
-    std::unique_ptr<DiskManager>    disk_manager_;
-    std::unique_ptr<HeaderManager>  header_manager_;
-    std::unique_ptr<BufferPool>     buffer_pool_;
-    std::unique_ptr<WALManager>     wal_manager_;
-    std::unique_ptr<CatalogManager> catalog_manager_;
-    std::unique_ptr<Executor>       executor_;
+    std::unique_ptr<DiskManager>     disk_manager_;
+    std::unique_ptr<HeaderManager>   header_manager_;
+    std::unique_ptr<BufferPool>      buffer_pool_;
+    std::unique_ptr<WALManager>      wal_manager_;
+    std::unique_ptr<FreeListManager> free_list_manager_;
+    std::unique_ptr<CatalogManager>  catalog_manager_;
+    std::unique_ptr<Executor>        executor_;
 
     // ── Database-level statement handlers ────────────────────────────────────
 
