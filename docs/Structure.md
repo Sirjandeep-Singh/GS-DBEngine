@@ -1,11 +1,9 @@
 <pre>
-mydbengine/
+GS-DBEngine/
 ├── src/
 │   ├── storage/
 │   │   ├── disk_manager.h
 │   │   ├── disk_manager.cpp
-│   │   ├── header_manager.h
-│   │   ├── header_manager.cpp
 │   │   ├── page.h               ← just the Page struct, no .cpp needed
 │   │   └── buffer_pool.h
 │   │   └── buffer_pool.cpp
@@ -14,9 +12,12 @@ mydbengine/
 │   │   ├── wal_manager.h
 │   │   └── wal_manager.cpp
 │   │
+│   ├── header/
+│   │   ├── header_manager.h
+│   │   └── header_manager.cpp
+│   │
 │   ├── catalog/
-│   │   ├── schema.h             ← Table, Column structs
-│   │   ├── schema.cpp
+│   │   ├── schema.h             ← Table, Column structs (header-only)
 │   │   ├── catalog_manager.h
 │   │   └── catalog_manager.cpp
 │   │
@@ -24,11 +25,12 @@ mydbengine/
 │   │   ├── btree.h
 │   │   ├── btree.cpp
 │   │   ├── btree_node.h         ← internal/leaf node structs
-│   │   └── btree_node.cpp
+│   │   ├── btree_node.cpp
+│   │   ├── free_list_manager.h
+│   │   └── free_list_manager.cpp
 │   │
 │   ├── row/
-│   │   ├── row.h                ← Row struct, column value types
-│   │   ├── row.cpp
+│   │   ├── row.h                ← Row struct, column value types (header-only)
 │   │   ├── serializer.h
 │   │   └── serializer.cpp
 │   │
@@ -37,12 +39,12 @@ mydbengine/
 │   │   └── table.cpp
 │   │
 │   ├── parser/
+│   │   ├── token.h
 │   │   ├── tokenizer.h
 │   │   ├── tokenizer.cpp
 │   │   ├── parser.h
 │   │   ├── parser.cpp
-│   │   ├── ast.h                ← all AST node structs
-│   │   └── ast.cpp
+│   │   └── ast.h                ← all AST node structs (header-only)
 │   │
 │   ├── executor/
 │   │   ├── executor.h
@@ -52,12 +54,24 @@ mydbengine/
 │   └── database.cpp
 │
 ├── tests/
-│   ├── test_disk_manager.cpp
-│   ├── test_buffer_pool.cpp
+│   ├── test_storage.cpp
+│   ├── test_header_manager.cpp
+│   ├── test_wal.cpp
+│   ├── test_catalog.cpp
+│   ├── test_btree_node.cpp
 │   ├── test_btree.cpp
-│   └── ...
+│   ├── test_row.cpp
+│   ├── test_table.cpp
+│   ├── test_tokenizer.cpp
+│   ├── test_parser.cpp
+│   ├── test_executor.cpp
+│   └── test_database.cpp
 │
-├── databases/                   ← where .db and .wal files live at runtime
+├── cli/
+│   └── main.cpp
+│
+├── ~/Documents/GS-DBEngine/     ← where .db and .wal files live at runtime
+│                                  (outside the repo — see DECISIONS.md)
 │
 ├── CMakeLists.txt               ← build system
 └── README.md
