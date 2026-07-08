@@ -116,6 +116,23 @@ QueryResult Executor::execute_create_table(const CreateTableStmt& stmt)
                        "': only one PRIMARY KEY column is allowed"};
     }
 
+    // Compile CHECK expressions (column-level, then table-level) into the
+    // catalog's flat CheckConstraint list. Any unsupported shape (OR, NOT,
+    // unknown column, etc.) aborts CREATE TABLE with a clear error instead
+    // of silently dropping the constraint.
+    try {
+        for (const auto& col_def : stmt.columns) {
+            if (col_def.check) {
+                flatten_check_expr(col_def.check, schema, schema.checks);
+            }
+        }
+        for (const auto& table_check : stmt.table_checks) {
+            flatten_check_expr(table_check, schema, schema.checks);
+        }
+    } catch (const std::exception& e) {
+        return {false, "CREATE TABLE '" + stmt.table_name + "': " + e.what()};
+    }
+
     // Register in catalog (root_page = INVALID_PAGE at this point)
     catalog_.create_table(schema);
 
@@ -212,6 +229,15 @@ QueryResult Executor::execute_insert(const InsertStmt& stmt)
             }
             row.values[static_cast<size_t>(idx)] = stmt.values[i];
         }
+    }
+
+    int violated = find_violated_check(schema, row);
+    if (violated >= 0) {
+        const CheckConstraint& c = schema.checks[static_cast<size_t>(violated)];
+        return {false, "INSERT: CHECK constraint violated on column '" +
+                       schema.columns[c.column_index].name + "' (" +
+                       schema.columns[c.column_index].name + " " +
+                       check_op_symbol(c.op) + " " + value_to_string(c.operand) + ")"};
     }
 
     Table tbl(schema, buffer_pool_, wal_, free_list_);
@@ -451,8 +477,29 @@ QueryResult Executor::execute_update(const UpdateStmt& stmt)
     }
 
     Table     tbl(schema, buffer_pool_, wal_, free_list_);
-    Predicate pred  = build_predicate(stmt.where, schema);
-    uint32_t  count = tbl.update_where(pred, new_values);
+    Predicate pred = build_predicate(stmt.where, schema);
+
+    // Validate CHECK constraints against every row's post-update values
+    // *before* touching storage — a single violation aborts the whole
+    // UPDATE with no rows changed, matching CHECK's statement-level atomicity.
+    if (!schema.checks.empty()) {
+        for (const auto& match : tbl.scan(pred)) {
+            Row candidate = match.row;
+            for (const auto& [idx, val] : new_values) {
+                candidate.values[idx] = val;
+            }
+            int violated = find_violated_check(schema, candidate);
+            if (violated >= 0) {
+                const CheckConstraint& c = schema.checks[static_cast<size_t>(violated)];
+                return {false, "UPDATE: CHECK constraint violated on column '" +
+                               schema.columns[c.column_index].name + "' (" +
+                               schema.columns[c.column_index].name + " " +
+                               check_op_symbol(c.op) + " " + value_to_string(c.operand) + ")"};
+            }
+        }
+    }
+
+    uint32_t count = tbl.update_where(pred, new_values);
 
     if (tbl.root_page() != schema.root_page) {
         catalog_.update_table_root(stmt.table_name, tbl.root_page());
@@ -630,6 +677,100 @@ Predicate Executor::build_predicate(const WhereExprPtr& where,
     return [this, &where, &schema, right_schema](const Row& row) {
         return evaluate_where(where, row, schema, right_schema);
     };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CHECK constraints
+// ─────────────────────────────────────────────────────────────────────────────
+
+CheckOp Executor::compare_op_to_check_op(CompareOp op) const {
+    switch (op) {
+        case CompareOp::EQ:  return CheckOp::EQ;
+        case CompareOp::NEQ: return CheckOp::NEQ;
+        case CompareOp::LT:  return CheckOp::LT;
+        case CompareOp::GT:  return CheckOp::GT;
+        case CompareOp::LTE: return CheckOp::LTE;
+        case CompareOp::GTE: return CheckOp::GTE;
+        default:
+            throw std::runtime_error(
+                "unsupported operator in CHECK constraint — "
+                "only =, !=, <, >, <=, >= are supported (not IS NULL / LIKE)");
+    }
+}
+
+CompareOp Executor::check_op_to_compare_op(CheckOp op) const {
+    switch (op) {
+        case CheckOp::EQ:  return CompareOp::EQ;
+        case CheckOp::NEQ: return CompareOp::NEQ;
+        case CheckOp::LT:  return CompareOp::LT;
+        case CheckOp::GT:  return CompareOp::GT;
+        case CheckOp::LTE: return CompareOp::LTE;
+        case CheckOp::GTE: return CompareOp::GTE;
+    }
+    throw std::runtime_error("unknown CheckOp");
+}
+
+void Executor::flatten_check_expr(const WhereExprPtr&           expr,
+                                   const TableSchema&            schema,
+                                   std::vector<CheckConstraint>& out) const
+{
+    if (!expr) return;
+
+    if (expr->kind == WhereExpr::Kind::LOGICAL) {
+        // SQL has no chained comparisons (30 < x < 50 is invalid SQL), so
+        // CHECK (x > 30 AND x < 50) is exactly an AND-chain of simple
+        // comparisons — split it into separate, implicitly-ANDed entries.
+        if (expr->logical_op == LogicalOp::AND) {
+            flatten_check_expr(expr->left,  schema, out);
+            flatten_check_expr(expr->right, schema, out);
+            return;
+        }
+        throw std::runtime_error(
+            "unsupported CHECK expression — only AND of simple comparisons "
+            "is supported (no OR / NOT)");
+    }
+
+    // COMPARE leaf: column OP literal
+    const CompareExpr& cmp = expr->compare;
+    if (!cmp.column.table_name.empty()) {
+        throw std::runtime_error(
+            "CHECK constraint column references must be unqualified: '" +
+            cmp.column.column_name + "'");
+    }
+    int idx = schema.column_index(cmp.column.column_name);
+    if (idx < 0) {
+        throw std::runtime_error(
+            "CHECK constraint references unknown column '" +
+            cmp.column.column_name + "'");
+    }
+
+    CheckConstraint c;
+    c.column_index = static_cast<uint32_t>(idx);
+    c.op           = compare_op_to_check_op(cmp.op);  // throws for IS_NULL/LIKE
+    c.operand      = cmp.operand;
+    out.push_back(std::move(c));
+}
+
+int Executor::find_violated_check(const TableSchema& schema, const Row& row) const
+{
+    for (size_t i = 0; i < schema.checks.size(); ++i) {
+        const CheckConstraint& c = schema.checks[i];
+
+        CompareExpr cmp;
+        cmp.column.column_name = schema.columns[c.column_index].name;
+        cmp.op                 = check_op_to_compare_op(c.op);
+        cmp.operand             = c.operand;
+
+        // A CHECK is satisfied when the expression is TRUE or UNKNOWN (SQL
+        // three-valued logic) — it only fails when the expression is FALSE.
+        // evaluate_compare() already returns false for any NULL operand, so
+        // a NULL column value passes the check here, matching ANSI semantics.
+        if (is_null(row.get(c.column_index))) continue;
+        if (!evaluate_compare(cmp, row, schema)) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -184,6 +184,53 @@ static std::string read_string(const std::vector<uint8_t>& buf, size_t& pos) {
     return str;
 }
 
+static void write_float(std::vector<uint8_t>& buf, float val) {
+    uint32_t bits;
+    std::memcpy(&bits, &val, sizeof(bits));
+    write_uint32(buf, bits);
+}
+
+static float read_float(const std::vector<uint8_t>& buf, size_t& pos) {
+    uint32_t bits = read_uint32(buf, pos);
+    float val;
+    std::memcpy(&val, &bits, sizeof(val));
+    return val;
+}
+
+// Value tag bytes — match the alternative index order in row.h's Value variant.
+enum ValueTag : uint8_t { TAG_NULL = 0, TAG_INT = 1, TAG_FLOAT = 2, TAG_BOOL = 3, TAG_STRING = 4 };
+
+static void write_value(std::vector<uint8_t>& buf, const Value& v) {
+    if (is_null(v)) {
+        write_uint8(buf, TAG_NULL);
+    } else if (std::holds_alternative<int32_t>(v)) {
+        write_uint8(buf, TAG_INT);
+        write_uint32(buf, static_cast<uint32_t>(get_int(v)));
+    } else if (std::holds_alternative<float>(v)) {
+        write_uint8(buf, TAG_FLOAT);
+        write_float(buf, get_float(v));
+    } else if (std::holds_alternative<bool>(v)) {
+        write_uint8(buf, TAG_BOOL);
+        write_uint8(buf, get_bool(v) ? 1 : 0);
+    } else {
+        write_uint8(buf, TAG_STRING);
+        write_string(buf, get_string(v));
+    }
+}
+
+static Value read_value(const std::vector<uint8_t>& buf, size_t& pos) {
+    uint8_t tag = read_uint8(buf, pos);
+    switch (tag) {
+        case TAG_NULL:   return std::monostate{};
+        case TAG_INT:    return static_cast<int32_t>(read_uint32(buf, pos));
+        case TAG_FLOAT:  return read_float(buf, pos);
+        case TAG_BOOL:   return read_uint8(buf, pos) != 0;
+        case TAG_STRING: return read_string(buf, pos);
+        default:
+            throw std::runtime_error("CatalogManager::read_value: unknown value tag");
+    }
+}
+
 std::vector<uint8_t> CatalogManager::serialize() const {
     std::vector<uint8_t> buf;
 
@@ -201,6 +248,12 @@ std::vector<uint8_t> CatalogManager::serialize() const {
             write_uint8(buf, col.is_nullable    ? 1 : 0);
             write_uint8(buf, col.is_primary_key ? 1 : 0);
             write_uint8(buf, col.auto_increment ? 1 : 0);
+        }
+        write_uint32(buf, static_cast<uint32_t>(schema.checks.size()));
+        for (auto& c : schema.checks) {
+            write_uint32(buf, c.column_index);
+            write_uint8(buf, static_cast<uint8_t>(c.op));
+            write_value(buf, c.operand);
         }
     }
 
@@ -244,6 +297,15 @@ void CatalogManager::deserialize(const std::vector<uint8_t>& data) {
             col.is_primary_key = read_uint8(data, pos) != 0;
             col.auto_increment = read_uint8(data, pos) != 0;
             schema.columns.push_back(col);
+        }
+
+        uint32_t num_checks = read_uint32(data, pos);
+        for (uint32_t j = 0; j < num_checks; j++) {
+            CheckConstraint c;
+            c.column_index = read_uint32(data, pos);
+            c.op            = static_cast<CheckOp>(read_uint8(data, pos));
+            c.operand       = read_value(data, pos);
+            schema.checks.push_back(std::move(c));
         }
 
         tables_[schema.name] = schema;

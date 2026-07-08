@@ -31,7 +31,7 @@
 | CMake package config | `GSDBEngineConfig.cmake` + `GSDBEngineTargets.cmake` → consumers use `find_package(GSDBEngine)` | ✅ |
 | End-to-end consumer validation | Standalone external test project (`find_package` + `target_link_libraries`, zero manual `-I`/`-L`/`-l`) — built, linked, and ran real SQL successfully | ✅ |
 | pkg-config (.pc) support | For plain-g++ consumers without CMake | ⬜ Not started (stretch) |
-| README.md | End-user build/install/usage instructions | ✅ Not started |
+| README.md | End-user build/install/usage instructions | ✅|
 
 ## Known Issues / Gaps
 - No secondary index execution (schema supports it, execution not yet wired up)

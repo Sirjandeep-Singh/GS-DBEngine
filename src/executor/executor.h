@@ -128,6 +128,26 @@ private:
     // Validates type, VARCHAR length, and that AUTO_INCREMENT is INT only.
     Column column_def_to_column(const ColumnDef& def) const;
 
+    // ── CHECK constraint helpers ─────────────────────────────────────────────
+
+    // "Compiles" a parsed CHECK expression (column-level or table-level) into
+    // the catalog's flat, serializable CheckConstraint list. Only supports an
+    // AND-chain of simple `column OP literal` comparisons — SQL has no chained
+    // comparisons (30 < x < 50 is invalid SQL), so CHECK (x > 30 AND x < 50)
+    // is exactly this shape: two ANDed comparisons. Throws std::runtime_error
+    // for anything else (OR, NOT, qualified/unknown columns, IS NULL, LIKE).
+    void flatten_check_expr(const WhereExprPtr&           expr,
+                             const TableSchema&            schema,
+                             std::vector<CheckConstraint>& out) const;
+
+    CheckOp    compare_op_to_check_op(CompareOp op) const;
+    CompareOp  check_op_to_compare_op(CheckOp op) const;
+
+    // Evaluates all of schema.checks against a row (all implicitly ANDed).
+    // Returns the violated constraint's index, or -1 if the row passes.
+    // Reuses evaluate_compare() so the same NULL/int-float semantics apply.
+    int find_violated_check(const TableSchema& schema, const Row& row) const;
+
     // ── Result formatting ────────────────────────────────────────────────────
 
     // Converts a Row's values to strings via value_to_string().

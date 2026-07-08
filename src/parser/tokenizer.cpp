@@ -226,6 +226,7 @@ TokenType Tokenizer::keyword_or_identifier(const std::string& word) {
     if (upper == "PRIMARY")        return TokenType::PRIMARY;
     if (upper == "KEY")            return TokenType::KEY;
     if (upper == "AUTO_INCREMENT") return TokenType::AUTO_INCREMENT;
+    if (upper == "CHECK")          return TokenType::CHECK;
     if (upper == "INT")            return TokenType::INT_KW;
     if (upper == "FLOAT")          return TokenType::FLOAT_KW;
     if (upper == "BOOLEAN")        return TokenType::BOOLEAN_KW;
@@ -274,6 +275,7 @@ std::string token_type_name(TokenType type) {
         case TokenType::PRIMARY:         return "PRIMARY";
         case TokenType::KEY:             return "KEY";
         case TokenType::AUTO_INCREMENT:  return "AUTO_INCREMENT";
+        case TokenType::CHECK:           return "CHECK";
         case TokenType::INT_KW:          return "INT";
         case TokenType::FLOAT_KW:        return "FLOAT";
         case TokenType::BOOLEAN_KW:      return "BOOLEAN";
