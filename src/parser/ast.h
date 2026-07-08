@@ -144,11 +144,13 @@ struct ColumnDef {
     bool        is_primary_key   = false;
     bool        is_nullable      = true;
     bool        auto_increment   = false;
+    WhereExprPtr check           = nullptr;  // column-level CHECK (...), null if none
 };
 
 struct CreateTableStmt {
     std::string             table_name;
     std::vector<ColumnDef>  columns;
+    std::vector<WhereExprPtr> table_checks;  // table-level CHECK (...) clauses
 };
 
 // ─────────────────────────────────────────────

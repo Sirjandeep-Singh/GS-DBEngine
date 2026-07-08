@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include "../row/row.h"  // for Value — a dependency-free leaf header, safe at this layer
 
 // supported column types
 enum class ColumnType : uint8_t {
@@ -44,12 +45,52 @@ struct Column {
     bool        auto_increment; // only valid for INT primary keys
 };
 
+// comparison operators supported in a CHECK constraint.
+// deliberately a small, flat set — SQL has no chained comparisons
+// (`30 < x < 50` is not valid SQL), so every CHECK constraint is
+// represented as one or more simple `column OP literal` comparisons,
+// implicitly ANDed together. `CHECK (x > 30 AND x < 50)` becomes two
+// CheckConstraint entries: {x, GT, 30} and {x, LT, 50}.
+enum class CheckOp : uint8_t {
+    EQ  = 1,
+    NEQ = 2,
+    LT  = 3,
+    GT  = 4,
+    LTE = 5,
+    GTE = 6,
+};
+
+inline std::string check_op_symbol(CheckOp op) {
+    switch (op) {
+        case CheckOp::EQ:  return "=";
+        case CheckOp::NEQ: return "!=";
+        case CheckOp::LT:  return "<";
+        case CheckOp::GT:  return ">";
+        case CheckOp::LTE: return "<=";
+        case CheckOp::GTE: return ">=";
+    }
+    return "?";
+}
+
+// A single CHECK constraint: schema.columns[column_index] OP operand.
+// This is deliberately a flat, POD-like, serializable representation —
+// NOT a parser AST node. It has to survive CatalogManager's binary
+// serialize()/deserialize() round-trip to disk and back, and TableSchema
+// must stay copyable, so nothing here may own a recursive expression
+// tree (no unique_ptr, no std::function).
+struct CheckConstraint {
+    uint32_t column_index;
+    CheckOp  op;
+    Value    operand;
+};
+
 // describes a complete table — its name, columns, and where its data lives
 struct TableSchema {
-    std::string         name;           // table name
-    std::vector<Column> columns;        // column definitions, in order
-    uint32_t            root_page;      // page_id of the B+ tree root for this table
-    uint32_t            primary_key_index; // index into columns[] of the primary key column
+    std::string              name;           // table name
+    std::vector<Column>      columns;        // column definitions, in order
+    uint32_t                 root_page;      // page_id of the B+ tree root for this table
+    uint32_t                 primary_key_index; // index into columns[] of the primary key column
+    std::vector<CheckConstraint> checks;     // CHECK constraints, all implicitly ANDed together
 
     // returns the column index for a given column name, or -1 if not found
     int column_index(const std::string& col_name) const {

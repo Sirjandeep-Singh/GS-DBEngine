@@ -277,7 +277,15 @@ Statement Parser::parse_create_table() {
     expect(TokenType::LPAREN, "CREATE TABLE columns");
 
     do {
-        stmt.columns.push_back(parse_column_def());
+        if (check(TokenType::CHECK)) {
+            // table-level constraint: CHECK (expr) — not tied to one column def
+            advance();  // consume CHECK
+            expect(TokenType::LPAREN, "CHECK (...)");
+            stmt.table_checks.push_back(parse_or_expr());
+            expect(TokenType::RPAREN, "CHECK (...)");
+        } else {
+            stmt.columns.push_back(parse_column_def());
+        }
     } while (match(TokenType::COMMA));
 
     expect(TokenType::RPAREN, "CREATE TABLE columns");
@@ -321,6 +329,10 @@ ColumnDef Parser::parse_column_def() {
                    && tokens_[pos_ + 1].type == TokenType::NULL_KW) {
             advance(); advance();  // consume NOT NULL
             def.is_nullable = false;
+        } else if (match(TokenType::CHECK)) {
+            expect(TokenType::LPAREN, "CHECK (...)");
+            def.check = parse_or_expr();
+            expect(TokenType::RPAREN, "CHECK (...)");
         } else {
             parsing_constraints = false;
         }
