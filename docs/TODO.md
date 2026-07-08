@@ -1,12 +1,10 @@
 # TODO
 
 ## Stretch goals
-- [ ] enable CHECK keyword
-- [ ] Multi-statement transactions (BEGIN / COMMIT / ROLLBACK)
-- [ ] enable FOREIGN KEY
-- [ ] Secondary indexes (CREATE INDEX)
-- [ ] enable UNQIUE
-- [ ] COUNT(*) aggregate
+- [ ] Multi-statement transactions (BEGIN / COMMIT / ROLLBACK) - not important YET
+- [ ] enable FOREIGN KEY - IMP
+- [ ] Secondary indexes (CREATE INDEX) - IMP
+- [ ] enable UNQIUE = IMP
 - [ ] MVCC
 - [ ] pkg-config (.pc) file — covers plain g++ consumers who don't use CMake
 - [ ] Amalgamation build (single .cpp + .h, SQLite-style) — nice-to-have, not required at current scope
