@@ -10,7 +10,7 @@ enum class TokenType {
     AND, OR, NOT, NULL_KW,               // NULL_KW to avoid clash with NULL macro
     IS, LIKE, ORDER, BY, ASC, DESC,
     LIMIT, JOIN, INNER, LEFT, RIGHT, ON,
-    PRIMARY, KEY, AUTO_INCREMENT, CHECK,
+    PRIMARY, KEY, AUTO_INCREMENT, CHECK, COUNT,
     INT_KW, FLOAT_KW, BOOLEAN_KW, VARCHAR_KW,  // type keywords
     TRUE_KW, FALSE_KW,                           // boolean literals as keywords
 

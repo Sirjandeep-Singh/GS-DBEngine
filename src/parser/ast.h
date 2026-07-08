@@ -66,10 +66,17 @@ struct WhereExpr {
 // SELECT statement
 // ─────────────────────────────────────────────
 
-// A selected column: *, name, users.name, COUNT(*) (count is stretch goal)
+// Aggregate functions usable in a SELECT column list.
+// v1 scope: COUNT only, and only when every column in the SELECT list is
+// an aggregate (no GROUP BY yet, so mixing aggregate + plain columns is
+// not meaningful — that's exactly what GROUP BY exists to make meaningful).
+enum class AggregateType { NONE, COUNT_STAR, COUNT_COLUMN };
+
+// A selected column: *, name, users.name, COUNT(*), COUNT(name)
 struct SelectColumn {
-    bool      is_star = false;    // SELECT *
-    ColumnRef column;             // used if not star
+    bool          is_star   = false;    // SELECT *
+    ColumnRef     column;               // used if not star, or if aggregate == COUNT_COLUMN
+    AggregateType aggregate = AggregateType::NONE;
 };
 
 // JOIN types supported

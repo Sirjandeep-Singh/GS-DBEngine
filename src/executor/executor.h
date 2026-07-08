@@ -54,6 +54,13 @@ private:
     // ── Statement handlers ───────────────────────────────────────────────────
 
     QueryResult execute_select(const SelectStmt& stmt);
+
+    // Handles SELECT lists where every column is an aggregate (COUNT(*) /
+    // COUNT(col)) — a single-row result computed over a WHERE-filtered scan.
+    // v1 scope: no JOIN, no GROUP BY (see AggregateType comment in ast.h).
+    QueryResult execute_select_aggregate(const SelectStmt&  stmt,
+                                          const TableSchema& schema,
+                                          Table&              tbl) const;
     QueryResult execute_insert(const InsertStmt& stmt);
     QueryResult execute_update(const UpdateStmt& stmt);
     QueryResult execute_delete(const DeleteStmt& stmt);

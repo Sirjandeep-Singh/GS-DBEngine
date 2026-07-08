@@ -260,6 +260,28 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
     const TableSchema& schema = catalog_.get_table(stmt.table_name);
     Table left_tbl(schema, buffer_pool_, wal_, free_list_);
 
+    // ── Aggregate (COUNT) queries ───────────────────────────────────────────
+    // No GROUP BY yet, so the only meaningful case is: every column in the
+    // SELECT list is an aggregate (mixing aggregate + plain columns without
+    // GROUP BY is what real SQL engines reject too — GROUP BY is exactly
+    // what makes that combination well-defined).
+    bool any_aggregate = false;
+    bool all_aggregate  = true;
+    for (const auto& sc : stmt.columns) {
+        if (sc.aggregate != AggregateType::NONE) any_aggregate = true;
+        else                                      all_aggregate = false;
+    }
+    if (any_aggregate) {
+        if (!all_aggregate) {
+            return {false, "SELECT: cannot mix aggregate functions with plain "
+                           "columns without GROUP BY (not yet supported)"};
+        }
+        if (!stmt.joins.empty()) {
+            return {false, "SELECT: aggregate functions are not yet supported with JOIN"};
+        }
+        return execute_select_aggregate(stmt, schema, left_tbl);
+    }
+
     QueryResult result;
     result.success = true;
 
@@ -371,6 +393,39 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
         }
     }
 
+    return result;
+}
+
+QueryResult Executor::execute_select_aggregate(const SelectStmt&  stmt,
+                                                const TableSchema& schema,
+                                                Table&              tbl) const
+{
+    Predicate pred = build_predicate(stmt.where, schema);
+    std::vector<ScanResult> rows = tbl.scan(pred);
+
+    QueryResult result;
+    result.success = true;
+
+    std::vector<std::string> row_out;
+    row_out.reserve(stmt.columns.size());
+
+    for (const auto& sc : stmt.columns) {
+        if (sc.aggregate == AggregateType::COUNT_STAR) {
+            result.columns.push_back("COUNT(*)");
+            row_out.push_back(std::to_string(rows.size()));
+        } else {
+            // COUNT(column) — count only non-NULL values at this column
+            size_t   idx   = resolve_column(sc.column, schema);  // throws on unknown column
+            uint32_t count = 0;
+            for (const auto& sr : rows) {
+                if (!is_null(sr.row.get(idx))) count++;
+            }
+            result.columns.push_back("COUNT(" + sc.column.column_name + ")");
+            row_out.push_back(std::to_string(count));
+        }
+    }
+
+    result.rows.push_back(std::move(row_out));
     return result;
 }
 

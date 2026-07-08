@@ -133,15 +133,27 @@ Statement Parser::parse_select() {
 std::vector<SelectColumn> Parser::parse_select_columns() {
     std::vector<SelectColumn> cols;
 
-    if (match(TokenType::STAR)) {
-        cols.push_back({true, {}});
+    if (check(TokenType::STAR)) {
+        advance();
+        cols.push_back({true, {}, AggregateType::NONE});
         return cols;
     }
 
     do {
         SelectColumn col;
-        col.is_star = false;
-        col.column  = parse_column_ref();
+        if (match(TokenType::COUNT)) {
+            expect(TokenType::LPAREN, "COUNT(...)");
+            if (match(TokenType::STAR)) {
+                col.aggregate = AggregateType::COUNT_STAR;
+            } else {
+                col.column    = parse_column_ref();
+                col.aggregate = AggregateType::COUNT_COLUMN;
+            }
+            expect(TokenType::RPAREN, "COUNT(...)");
+        } else {
+            col.is_star = false;
+            col.column  = parse_column_ref();
+        }
         cols.push_back(std::move(col));
     } while (match(TokenType::COMMA));
 
