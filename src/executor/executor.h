@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <unordered_map>
 
 #include "../parser/ast.h"
 #include "../catalog/catalog_manager.h"
@@ -73,25 +74,67 @@ private:
     QueryResult execute_drop_database(const DropDatabaseStmt& stmt);
     QueryResult execute_use(const UseStmt& stmt);
 
+    // ── Subqueries (IN / NOT IN / EXISTS / NOT EXISTS) ──────────────────────
+    //
+    // v1 scope: non-correlated only — the subquery doesn't reference any
+    // column from the outer row, so it's the same result for every outer
+    // row. It's executed exactly once per statement (in precompute_subqueries,
+    // before scanning), not once per row — re-running an identical query
+    // per row would be a correctness-preserving but needlessly slow choice.
+
+    // Cache of pre-computed subquery results for one WHERE tree, keyed by
+    // the address of the AST node that owns the subquery. Node addresses
+    // are stable for the cache's lifetime: every WhereExpr/CompareExpr is
+    // heap-allocated once via unique_ptr and never copied or moved after
+    // parsing, so &node stays valid as long as the AST does.
+    struct SubqueryCache {
+        std::unordered_map<const CompareExpr*, std::vector<Value>> in_values;      // IN_SUBQUERY / NOT_IN_SUBQUERY
+        std::unordered_map<const WhereExpr*,    bool>              exists_results; // EXISTS
+    };
+
+    // Walks a WHERE tree and runs every subquery it contains exactly once,
+    // storing results in cache. A no-op for any subtree with no subqueries.
+    void precompute_subqueries(const WhereExprPtr& expr, SubqueryCache& cache) const;
+
+    // Runs a subquery SELECT (no JOIN, no aggregate — v1 scope) and returns
+    // its raw scan results. Honors the subquery's own WHERE (recursively,
+    // via build_predicate) and LIMIT; ignores ORDER BY (irrelevant for
+    // set membership / existence checks).
+    std::vector<ScanResult> run_subquery_scan(const SelectStmt& subquery) const;
+
+    // Runs a subquery for IN/NOT IN — requires exactly one plain (non-star,
+    // non-aggregate) selected column, and returns that column's values.
+    std::vector<Value> run_subquery_values(const SelectStmt& subquery) const;
+
+    // Type-aware equality (int/float promotion, like evaluate_compare's EQ)
+    // used to test row values against a precomputed IN candidate set.
+    bool values_equal(const Value& a, const Value& b) const;
+
     // ── WHERE evaluation ─────────────────────────────────────────────────────
 
-    // Recursively evaluates a WhereExpr tree (AND / OR / NOT / compare)
+    // Recursively evaluates a WhereExpr tree (AND / OR / NOT / compare / EXISTS)
     // against a single row. Returns true if the row satisfies the expression.
     // right_schema is non-null for JOIN queries — enables two-schema column resolution.
-    bool evaluate_where(const WhereExprPtr& expr,
-                        const Row&          row,
-                        const TableSchema&  left_schema,
-                        const TableSchema*  right_schema = nullptr) const;
+    // cache holds pre-computed subquery results (see precompute_subqueries) —
+    // required (non-null) if expr contains any IN-subquery or EXISTS node.
+    bool evaluate_where(const WhereExprPtr&  expr,
+                        const Row&           row,
+                        const TableSchema&   left_schema,
+                        const TableSchema*   right_schema = nullptr,
+                        const SubqueryCache* cache         = nullptr) const;
 
     // Evaluates a single CompareExpr leaf node against a row.
-    bool evaluate_compare(const CompareExpr& expr,
-                          const Row&         row,
-                          const TableSchema& left_schema,
-                          const TableSchema* right_schema = nullptr) const;
+    bool evaluate_compare(const CompareExpr&   expr,
+                          const Row&           row,
+                          const TableSchema&   left_schema,
+                          const TableSchema*   right_schema = nullptr,
+                          const SubqueryCache* cache         = nullptr) const;
 
     // Returns a Predicate that wraps evaluate_where().
     // If where is nullptr, returns a predicate that always returns true.
-    // right_schema is non-null for JOIN queries.
+    // right_schema is non-null for JOIN queries. Precomputes any subqueries
+    // in 'where' exactly once and keeps the cache alive for the predicate's
+    // lifetime (captured by shared_ptr in the returned lambda).
     Predicate build_predicate(const WhereExprPtr& where,
                               const TableSchema&  schema,
                               const TableSchema*  right_schema = nullptr) const;

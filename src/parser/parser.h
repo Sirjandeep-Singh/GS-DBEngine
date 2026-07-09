@@ -66,6 +66,11 @@ private:
     Statement parse_statement();
 
     Statement parse_select();
+    // The actual SELECT grammar, returning a bare SelectStmt rather than the
+    // Statement variant — reused directly when parsing a subquery, which
+    // needs a SelectStmt to embed in an expression node, not a top-level
+    // Statement.
+    SelectStmt parse_select_body();
     Statement parse_insert();
     Statement parse_update();
     Statement parse_delete();
@@ -86,6 +91,12 @@ private:
     WhereExprPtr     parse_and_expr();
     WhereExprPtr     parse_not_expr();
     WhereExprPtr     parse_compare_expr();
+
+    // parses a parenthesized subquery: ( SELECT ... ) — used by
+    // IN (SELECT ...) and EXISTS (SELECT ...). Throws a clear error if the
+    // parens don't contain a SELECT (e.g. IN (1, 2, 3) value lists aren't
+    // supported yet — only subqueries are).
+    std::unique_ptr<SelectStmt> parse_subquery();
 
     // parses ORDER BY col [ASC|DESC] [, ...]
     std::vector<OrderByClause> parse_order_by();

@@ -363,11 +363,17 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
         std::vector<JoinedRow> joined =
             nested_loop_join(left_results, schema, right_tbl, right_schema, join);
 
-        // WHERE — two-schema resolve handles qualified right-table references
+        // WHERE — two-schema resolve handles qualified right-table references.
+        // Precompute any subqueries once, before the loop — same reasoning
+        // as build_predicate() for the non-JOIN path.
+        SubqueryCache where_cache;
+        if (stmt.where) precompute_subqueries(stmt.where, where_cache);
+
         std::vector<JoinedRow> filtered;
         filtered.reserve(joined.size());
         for (auto& jr : joined) {
-            if (!stmt.where || evaluate_where(stmt.where, jr.row, schema, &right_schema)) {
+            if (!stmt.where ||
+                evaluate_where(stmt.where, jr.row, schema, &right_schema, &where_cache)) {
                 filtered.push_back(std::move(jr));
             }
         }
@@ -620,35 +626,45 @@ QueryResult Executor::execute_use(const UseStmt&) {
 // WHERE evaluation
 // ─────────────────────────────────────────────────────────────────────────────
 
-bool Executor::evaluate_where(const WhereExprPtr& expr,
-                               const Row&          row,
-                               const TableSchema&  left_schema,
-                               const TableSchema*  right_schema) const
+bool Executor::evaluate_where(const WhereExprPtr&  expr,
+                               const Row&            row,
+                               const TableSchema&    left_schema,
+                               const TableSchema*    right_schema,
+                               const SubqueryCache*  cache) const
 {
     if (!expr) return true;
 
     if (expr->kind == WhereExpr::Kind::COMPARE) {
-        return evaluate_compare(expr->compare, row, left_schema, right_schema);
+        return evaluate_compare(expr->compare, row, left_schema, right_schema, cache);
+    }
+
+    if (expr->kind == WhereExpr::Kind::EXISTS) {
+        if (!cache) {
+            throw std::runtime_error(
+                "internal error: EXISTS evaluated without a precomputed subquery cache");
+        }
+        return cache->exists_results.at(expr.get());
     }
 
     // LOGICAL node
     switch (expr->logical_op) {
         case LogicalOp::AND:
-            return evaluate_where(expr->left,  row, left_schema, right_schema) &&
-                   evaluate_where(expr->right, row, left_schema, right_schema);
+            return evaluate_where(expr->left,  row, left_schema, right_schema, cache) &&
+                   evaluate_where(expr->right, row, left_schema, right_schema, cache);
         case LogicalOp::OR:
-            return evaluate_where(expr->left,  row, left_schema, right_schema) ||
-                   evaluate_where(expr->right, row, left_schema, right_schema);
+            return evaluate_where(expr->left,  row, left_schema, right_schema, cache) ||
+                   evaluate_where(expr->right, row, left_schema, right_schema, cache);
         case LogicalOp::NOT:
-            return !evaluate_where(expr->left, row, left_schema, right_schema);
+            return !evaluate_where(expr->left, row, left_schema, right_schema, cache);
     }
     return false;
 }
 
-bool Executor::evaluate_compare(const CompareExpr& expr,
-                                 const Row&         row,
-                                 const TableSchema& left_schema,
-                                 const TableSchema* right_schema) const
+bool Executor::evaluate_compare(const CompareExpr&   expr,
+                                 const Row&            row,
+                                 const TableSchema&    left_schema,
+                                 const TableSchema*    right_schema,
+                                 const SubqueryCache*  cache) const
 {
     size_t col_idx = right_schema
         ? resolve_column(expr.column, left_schema, *right_schema)
@@ -658,6 +674,38 @@ bool Executor::evaluate_compare(const CompareExpr& expr,
     // IS NULL / IS NOT NULL do not examine the operand
     if (expr.op == CompareOp::IS_NULL)     return  is_null(val);
     if (expr.op == CompareOp::IS_NOT_NULL) return !is_null(val);
+
+    // column [NOT] IN (SELECT ...) — uses the precomputed candidate set,
+    // not expr.operand, so this must be handled before the generic
+    // null-operand check below (expr.operand is unused/default for these).
+    if (expr.op == CompareOp::IN_SUBQUERY || expr.op == CompareOp::NOT_IN_SUBQUERY) {
+        if (!cache) {
+            throw std::runtime_error(
+                "internal error: IN (SELECT ...) evaluated without a precomputed subquery cache");
+        }
+        // SQL: x IN (...) / x NOT IN (...) is UNKNOWN (never true) when x is NULL
+        if (is_null(val)) return false;
+
+        const std::vector<Value>& candidates = cache->in_values.at(&expr);
+        bool found    = false;
+        bool any_null = false;
+        for (const auto& c : candidates) {
+            if (is_null(c)) { any_null = true; continue; }
+            if (values_equal(val, c)) { found = true; break; }
+        }
+
+        if (expr.op == CompareOp::IN_SUBQUERY) {
+            return found;  // not-found-with-a-NULL-present is UNKNOWN, same
+                           // WHERE-excluded outcome as a definite not-found
+        }
+        // NOT IN — the classic ANSI SQL gotcha: if x isn't found among the
+        // non-NULL candidates but the subquery returned any NULL, the result
+        // is UNKNOWN (not TRUE) — NOT IN can only be definitely TRUE when
+        // every candidate was checked and none was NULL.
+        if (found)    return false;
+        if (any_null) return false;
+        return true;
+    }
 
     // SQL NULL semantics: any comparison with NULL yields false
     if (is_null(val))          return false;
@@ -727,11 +775,106 @@ Predicate Executor::build_predicate(const WhereExprPtr& where,
     if (!where) {
         return [](const Row&) { return true; };
     }
+    // Run any subqueries in 'where' exactly once, up front — not once per
+    // row. shared_ptr keeps the cache alive for as long as the returned
+    // predicate lambda is (it's cheap to copy-capture into the closure).
+    auto cache = std::make_shared<SubqueryCache>();
+    precompute_subqueries(where, *cache);
+
     // Capture by reference — safe because the predicate is only used within
     // the same execute_*() call frame, which keeps 'where' and 'schema' alive.
-    return [this, &where, &schema, right_schema](const Row& row) {
-        return evaluate_where(where, row, schema, right_schema);
+    return [this, &where, &schema, right_schema, cache](const Row& row) {
+        return evaluate_where(where, row, schema, right_schema, cache.get());
     };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Subqueries (IN / NOT IN / EXISTS / NOT EXISTS) — non-correlated
+// ─────────────────────────────────────────────────────────────────────────────
+
+void Executor::precompute_subqueries(const WhereExprPtr& expr, SubqueryCache& cache) const
+{
+    if (!expr) return;
+
+    if (expr->kind == WhereExpr::Kind::LOGICAL) {
+        precompute_subqueries(expr->left,  cache);
+        precompute_subqueries(expr->right, cache);  // no-op if null (NOT node)
+        return;
+    }
+
+    if (expr->kind == WhereExpr::Kind::EXISTS) {
+        bool non_empty = !run_subquery_scan(*expr->subquery).empty();
+        cache.exists_results[expr.get()] = non_empty;
+        return;
+    }
+
+    // COMPARE — only IN_SUBQUERY / NOT_IN_SUBQUERY carry a subquery to run
+    if (expr->compare.op == CompareOp::IN_SUBQUERY ||
+        expr->compare.op == CompareOp::NOT_IN_SUBQUERY) {
+        cache.in_values[&expr->compare] = run_subquery_values(*expr->compare.subquery);
+    }
+}
+
+std::vector<ScanResult> Executor::run_subquery_scan(const SelectStmt& subquery) const
+{
+    if (!subquery.joins.empty()) {
+        throw std::runtime_error(
+            "subqueries with JOIN are not yet supported");
+    }
+
+    const TableSchema& sub_schema = catalog_.get_table(subquery.table_name);
+    Table sub_tbl(sub_schema, buffer_pool_, wal_, free_list_);
+
+    // build_predicate() recursively precomputes any subqueries nested
+    // inside this subquery's own WHERE, so IN/EXISTS nesting just works.
+    Predicate pred = build_predicate(subquery.where, sub_schema);
+    std::vector<ScanResult> rows = sub_tbl.scan(pred);
+
+    if (subquery.limit.has_value()) {
+        size_t lim = static_cast<size_t>(subquery.limit.value());
+        if (rows.size() > lim) rows.resize(lim);
+    }
+    return rows;
+}
+
+std::vector<Value> Executor::run_subquery_values(const SelectStmt& subquery) const
+{
+    if (subquery.columns.size() != 1 ||
+        subquery.columns[0].is_star ||
+        subquery.columns[0].aggregate != AggregateType::NONE) {
+        throw std::runtime_error(
+            "a subquery used with IN / NOT IN must select exactly one plain "
+            "column (SELECT * and aggregate subqueries are not supported yet)");
+    }
+
+    const TableSchema& sub_schema = catalog_.get_table(subquery.table_name);
+    size_t col_idx = resolve_column(subquery.columns[0].column, sub_schema);
+
+    std::vector<Value> values;
+    for (const auto& sr : run_subquery_scan(subquery)) {
+        values.push_back(sr.row.get(col_idx));
+    }
+    return values;
+}
+
+bool Executor::values_equal(const Value& a, const Value& b) const
+{
+    if (is_null(a) || is_null(b)) return false;
+    return std::visit([](const auto& lhs, const auto& rhs) -> bool {
+        using L = std::decay_t<decltype(lhs)>;
+        using R = std::decay_t<decltype(rhs)>;
+        if constexpr (std::is_same_v<L, std::monostate> || std::is_same_v<R, std::monostate>) {
+            return false;
+        } else if constexpr ((std::is_same_v<L, int32_t> || std::is_same_v<L, float>) &&
+                              (std::is_same_v<R, int32_t> || std::is_same_v<R, float>) &&
+                              !std::is_same_v<L, R>) {
+            return static_cast<float>(lhs) == static_cast<float>(rhs);
+        } else if constexpr (std::is_same_v<L, R>) {
+            return lhs == rhs;
+        } else {
+            return false;
+        }
+    }, a, b);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -749,7 +892,8 @@ CheckOp Executor::compare_op_to_check_op(CompareOp op) const {
         default:
             throw std::runtime_error(
                 "unsupported operator in CHECK constraint — "
-                "only =, !=, <, >, <=, >= are supported (not IS NULL / LIKE)");
+                "only =, !=, <, >, <=, >= are supported "
+                "(not IS NULL / LIKE / IN / EXISTS)");
     }
 }
 
@@ -783,6 +927,11 @@ void Executor::flatten_check_expr(const WhereExprPtr&           expr,
         throw std::runtime_error(
             "unsupported CHECK expression — only AND of simple comparisons "
             "is supported (no OR / NOT)");
+    }
+
+    if (expr->kind == WhereExpr::Kind::EXISTS) {
+        throw std::runtime_error(
+            "CHECK constraints cannot contain EXISTS / subquery expressions");
     }
 
     // COMPARE leaf: column OP literal

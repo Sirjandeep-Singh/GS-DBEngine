@@ -94,6 +94,10 @@ Statement Parser::parse_statement() {
 // ─────────────────────────────────────────────
 
 Statement Parser::parse_select() {
+    return parse_select_body();
+}
+
+SelectStmt Parser::parse_select_body() {
     expect(TokenType::SELECT, "SELECT");
 
     SelectStmt stmt;
@@ -470,6 +474,18 @@ WhereExprPtr Parser::parse_not_expr() {
 }
 
 WhereExprPtr Parser::parse_compare_expr() {
+    // EXISTS (SELECT ...) — doesn't start with a column reference at all,
+    // so it has to be checked before parse_column_ref() is called. NOT
+    // EXISTS falls out of parse_not_expr() wrapping this in a LOGICAL/NOT
+    // node — no separate handling needed here.
+    if (check(TokenType::EXISTS)) {
+        advance();
+        auto node      = std::make_unique<WhereExpr>();
+        node->kind     = WhereExpr::Kind::EXISTS;
+        node->subquery = parse_subquery();
+        return node;
+    }
+
     auto node = std::make_unique<WhereExpr>();
     node->kind    = WhereExpr::Kind::COMPARE;
     node->compare.column = parse_column_ref();
@@ -487,6 +503,19 @@ WhereExprPtr Parser::parse_compare_expr() {
         return node;
     }
 
+    // column [NOT] IN (SELECT ...)
+    if (match(TokenType::NOT)) {
+        expect(TokenType::IN, "NOT IN (...)");
+        node->compare.op       = CompareOp::NOT_IN_SUBQUERY;
+        node->compare.subquery = parse_subquery();
+        return node;
+    }
+    if (match(TokenType::IN)) {
+        node->compare.op       = CompareOp::IN_SUBQUERY;
+        node->compare.subquery = parse_subquery();
+        return node;
+    }
+
     // comparison operators
     if (match(TokenType::EQ))  node->compare.op = CompareOp::EQ;
     else if (match(TokenType::NEQ)) node->compare.op = CompareOp::NEQ;
@@ -499,6 +528,17 @@ WhereExprPtr Parser::parse_compare_expr() {
 
     node->compare.operand = parse_value();
     return node;
+}
+
+std::unique_ptr<SelectStmt> Parser::parse_subquery() {
+    expect(TokenType::LPAREN, "subquery");
+    if (!check(TokenType::SELECT)) {
+        throw std::runtime_error(error_msg(
+            "SELECT (value lists like IN (1, 2, 3) are not supported yet — use a subquery)"));
+    }
+    auto sub = std::make_unique<SelectStmt>(parse_select_body());
+    expect(TokenType::RPAREN, "subquery");
+    return sub;
 }
 
 // ─────────────────────────────────────────────

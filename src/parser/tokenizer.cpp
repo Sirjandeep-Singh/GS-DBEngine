@@ -228,6 +228,8 @@ TokenType Tokenizer::keyword_or_identifier(const std::string& word) {
     if (upper == "AUTO_INCREMENT") return TokenType::AUTO_INCREMENT;
     if (upper == "CHECK")          return TokenType::CHECK;
     if (upper == "COUNT")          return TokenType::COUNT;
+    if (upper == "IN")             return TokenType::IN;
+    if (upper == "EXISTS")         return TokenType::EXISTS;
     if (upper == "INT")            return TokenType::INT_KW;
     if (upper == "FLOAT")          return TokenType::FLOAT_KW;
     if (upper == "BOOLEAN")        return TokenType::BOOLEAN_KW;
@@ -278,6 +280,8 @@ std::string token_type_name(TokenType type) {
         case TokenType::AUTO_INCREMENT:  return "AUTO_INCREMENT";
         case TokenType::CHECK:           return "CHECK";
         case TokenType::COUNT:           return "COUNT";
+        case TokenType::IN:              return "IN";
+        case TokenType::EXISTS:          return "EXISTS";
         case TokenType::INT_KW:          return "INT";
         case TokenType::FLOAT_KW:        return "FLOAT";
         case TokenType::BOOLEAN_KW:      return "BOOLEAN";

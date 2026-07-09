@@ -22,6 +22,13 @@ struct ColumnRef {
     std::string column_name;
 };
 
+// Forward declaration — SelectStmt is defined later (it contains a
+// WhereExprPtr), but IN (SELECT ...) / EXISTS (SELECT ...) need to embed a
+// SelectStmt inside an expression node. A pointer only needs the forward
+// declaration, so this breaks the mutual-recursion cycle the same way
+// WhereExprPtr already breaks WhereExpr's own self-recursion below.
+struct SelectStmt;
+
 // Comparison operators used in WHERE
 enum class CompareOp {
     EQ,    // =
@@ -33,13 +40,17 @@ enum class CompareOp {
     LIKE,  // LIKE
     IS_NULL,     // IS NULL
     IS_NOT_NULL, // IS NOT NULL
+    IN_SUBQUERY,     // column IN (SELECT ...)
+    NOT_IN_SUBQUERY, // column NOT IN (SELECT ...)
 };
 
-// A comparison expression: age > 25, name = 'Alice', email IS NULL
+// A comparison expression: age > 25, name = 'Alice', email IS NULL,
+// dept_id IN (SELECT id FROM depts ...)
 struct CompareExpr {
     ColumnRef column;
-    CompareOp op;
-    Value     operand;  // not used for IS_NULL / IS_NOT_NULL
+    CompareOp op = CompareOp::EQ;
+    Value     operand;   // not used for IS_NULL / IS_NOT_NULL / *_SUBQUERY
+    std::unique_ptr<SelectStmt> subquery;  // only used for IN_SUBQUERY / NOT_IN_SUBQUERY
 };
 
 // Logical connectives: AND, OR, NOT
@@ -49,9 +60,11 @@ enum class LogicalOp { AND, OR, NOT };
 struct WhereExpr;
 using WhereExprPtr = std::unique_ptr<WhereExpr>;
 
-// A WHERE expression node — either a comparison or a logical combination
+// A WHERE expression node — a comparison, a logical combination, or an
+// EXISTS (SELECT ...) check. NOT EXISTS is represented as a LOGICAL/NOT
+// node wrapping an EXISTS node — no separate "negated" flag needed.
 struct WhereExpr {
-    enum class Kind { COMPARE, LOGICAL } kind;
+    enum class Kind { COMPARE, LOGICAL, EXISTS } kind;
 
     // for COMPARE nodes
     CompareExpr compare;
@@ -60,6 +73,9 @@ struct WhereExpr {
     LogicalOp          logical_op;
     WhereExprPtr       left;
     WhereExprPtr       right;  // null for NOT
+
+    // for EXISTS nodes
+    std::unique_ptr<SelectStmt> subquery;
 };
 
 // ─────────────────────────────────────────────
