@@ -139,7 +139,9 @@ std::vector<SelectColumn> Parser::parse_select_columns() {
 
     if (check(TokenType::STAR)) {
         advance();
-        cols.push_back({true, {}, AggregateType::NONE});
+        SelectColumn col;
+        col.is_star = true;
+        cols.push_back(std::move(col));
         return cols;
     }
 
@@ -154,6 +156,15 @@ std::vector<SelectColumn> Parser::parse_select_columns() {
                 col.aggregate = AggregateType::COUNT_COLUMN;
             }
             expect(TokenType::RPAREN, "COUNT(...)");
+        } else if (check(TokenType::INTEGER_LITERAL) || check(TokenType::FLOAT_LITERAL) ||
+                   check(TokenType::STRING_LITERAL)  || check(TokenType::TRUE_KW) ||
+                   check(TokenType::FALSE_KW)        || check(TokenType::NULL_KW) ||
+                   check(TokenType::MINUS)) {
+            // A bare literal projection — most common as `SELECT 1 FROM ...`
+            // inside an EXISTS subquery, where the projected value doesn't
+            // matter and only row presence is checked.
+            col.is_literal = true;
+            col.literal     = parse_value();
         } else {
             col.is_star = false;
             col.column  = parse_column_ref();
@@ -526,7 +537,16 @@ WhereExprPtr Parser::parse_compare_expr() {
     else if (match(TokenType::LIKE)) node->compare.op = CompareOp::LIKE;
     else throw std::runtime_error(error_msg("comparison operator (=, !=, <, >, <=, >=, IS, LIKE)"));
 
-    node->compare.operand = parse_value();
+    // RHS is either a literal (age > 25) or another column reference
+    // (orders.user_id = users.id) — an IDENTIFIER here unambiguously means
+    // the latter, since no literal token type starts with IDENTIFIER.
+    // Column-vs-column comparisons are what let a subquery's WHERE clause
+    // reference a column from the outer query (correlated subqueries).
+    if (check(TokenType::IDENTIFIER)) {
+        node->compare.operand_column = parse_column_ref();
+    } else {
+        node->compare.operand = parse_value();
+    }
     return node;
 }
 

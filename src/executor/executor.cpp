@@ -328,13 +328,13 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
 
     if (stmt.joins.empty()) {
         // ── Simple (no JOIN) path ─────────────────────────────────────────────
-        Predicate pred = build_predicate(stmt.where, schema);
+        Predicate pred = build_predicate(stmt.where, schema, nullptr, nullptr, stmt.table_alias);
         std::vector<ScanResult> rows = left_tbl.scan(pred);
 
         // ORDER BY (only first clause honoured — no secondary sort key)
         if (!stmt.order_by.empty()) {
             const OrderByClause& ob = stmt.order_by[0];
-            size_t col_idx = resolve_column(ob.column, schema);
+            size_t col_idx = resolve_column(ob.column, schema, stmt.table_alias);
             sort_by_column(rows, col_idx, ob.ascending,
                            [](const ScanResult& sr) -> const Row& { return sr.row; });
         }
@@ -347,7 +347,7 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
 
         result.columns = build_column_headers(stmt.columns, schema);
         for (const auto& sr : rows) {
-            result.rows.push_back(project_row(stmt.columns, sr.row, schema));
+            result.rows.push_back(project_row(stmt.columns, sr.row, schema, nullptr, stmt.table_alias));
         }
 
     } else {
@@ -355,13 +355,15 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
         const JoinClause&  join         = stmt.joins[0];
         const TableSchema& right_schema = catalog_.get_table(join.table_name);
         Table              right_tbl(right_schema, buffer_pool_, wal_, free_list_);
+        const std::string& right_alias  = join.alias;  // "" if no alias given
 
         // Scan the left table completely first — WHERE is applied after joining
         Predicate all_rows = [](const Row&) { return true; };
         std::vector<ScanResult> left_results = left_tbl.scan(all_rows);
 
         std::vector<JoinedRow> joined =
-            nested_loop_join(left_results, schema, right_tbl, right_schema, join);
+            nested_loop_join(left_results, schema, right_tbl, right_schema, join,
+                              stmt.table_alias, right_alias);
 
         // WHERE — two-schema resolve handles qualified right-table references.
         // Precompute any subqueries once, before the loop — same reasoning
@@ -373,7 +375,8 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
         filtered.reserve(joined.size());
         for (auto& jr : joined) {
             if (!stmt.where ||
-                evaluate_where(stmt.where, jr.row, schema, &right_schema, &where_cache)) {
+                evaluate_where(stmt.where, jr.row, schema, &right_schema, &where_cache,
+                                nullptr, stmt.table_alias, right_alias)) {
                 filtered.push_back(std::move(jr));
             }
         }
@@ -381,7 +384,8 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
         // ORDER BY — two-schema resolve
         if (!stmt.order_by.empty()) {
             const OrderByClause& ob = stmt.order_by[0];
-            size_t col_idx = resolve_column(ob.column, schema, right_schema);
+            size_t col_idx = resolve_column(ob.column, schema, right_schema,
+                                             stmt.table_alias, right_alias);
             sort_by_column(filtered, col_idx, ob.ascending,
                            [](const JoinedRow& jr) -> const Row& { return jr.row; });
         }
@@ -395,7 +399,8 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
         result.columns = build_column_headers(stmt.columns, schema, &right_schema);
         for (const auto& jr : filtered) {
             result.rows.push_back(
-                project_row(stmt.columns, jr.row, schema, &right_schema));
+                project_row(stmt.columns, jr.row, schema, &right_schema,
+                            stmt.table_alias, right_alias));
         }
     }
 
@@ -406,7 +411,7 @@ QueryResult Executor::execute_select_aggregate(const SelectStmt&  stmt,
                                                 const TableSchema& schema,
                                                 Table&              tbl) const
 {
-    Predicate pred = build_predicate(stmt.where, schema);
+    Predicate pred = build_predicate(stmt.where, schema, nullptr, nullptr, stmt.table_alias);
     std::vector<ScanResult> rows = tbl.scan(pred);
 
     QueryResult result;
@@ -421,7 +426,7 @@ QueryResult Executor::execute_select_aggregate(const SelectStmt&  stmt,
             row_out.push_back(std::to_string(rows.size()));
         } else {
             // COUNT(column) — count only non-NULL values at this column
-            size_t   idx   = resolve_column(sc.column, schema);  // throws on unknown column
+            size_t   idx   = resolve_column(sc.column, schema, stmt.table_alias);  // throws on unknown column
             uint32_t count = 0;
             for (const auto& sr : rows) {
                 if (!is_null(sr.row.get(idx))) count++;
@@ -444,13 +449,15 @@ std::vector<Executor::JoinedRow> Executor::nested_loop_join(
     const TableSchema&             left_schema,
     Table&                         right_table,
     const TableSchema&             right_schema,
-    const JoinClause&              join) const
+    const JoinClause&              join,
+    const std::string&             left_alias,
+    const std::string&             right_alias) const
 {
     // Resolve the ON clause columns against their respective schemas.
     // join.left_col  — column in the left table
     // join.right_col — column in the right table
-    size_t left_col_idx  = resolve_column(join.left_col,  left_schema);
-    size_t right_col_idx = resolve_column(join.right_col, right_schema);
+    size_t left_col_idx  = resolve_column(join.left_col,  left_schema,  left_alias);
+    size_t right_col_idx = resolve_column(join.right_col, right_schema, right_alias);
 
     // Materialise the entire right side once (no predicate)
     Predicate all_rows = [](const Row&) { return true; };
@@ -630,12 +637,16 @@ bool Executor::evaluate_where(const WhereExprPtr&  expr,
                                const Row&            row,
                                const TableSchema&    left_schema,
                                const TableSchema*    right_schema,
-                               const SubqueryCache*  cache) const
+                               const SubqueryCache*  cache,
+                               const OuterContext*   outer,
+                               const std::string&    left_alias,
+                               const std::string&    right_alias) const
 {
     if (!expr) return true;
 
     if (expr->kind == WhereExpr::Kind::COMPARE) {
-        return evaluate_compare(expr->compare, row, left_schema, right_schema, cache);
+        return evaluate_compare(expr->compare, row, left_schema, right_schema, cache, outer,
+                                 left_alias, right_alias);
     }
 
     if (expr->kind == WhereExpr::Kind::EXISTS) {
@@ -643,19 +654,31 @@ bool Executor::evaluate_where(const WhereExprPtr&  expr,
             throw std::runtime_error(
                 "internal error: EXISTS evaluated without a precomputed subquery cache");
         }
+        // Correlated: this outer row's own values feed into the subquery's
+        // WHERE (via OuterContext), so the inner scan has to happen fresh,
+        // right now, for THIS row — it wasn't and couldn't be precomputed.
+        if (cache->correlated_exists.count(expr.get())) {
+            OuterContext this_row{&row, &left_schema, right_schema, left_alias, right_alias};
+            return !run_subquery_scan(*expr->subquery, &this_row).empty();
+        }
         return cache->exists_results.at(expr.get());
     }
 
     // LOGICAL node
     switch (expr->logical_op) {
         case LogicalOp::AND:
-            return evaluate_where(expr->left,  row, left_schema, right_schema, cache) &&
-                   evaluate_where(expr->right, row, left_schema, right_schema, cache);
+            return evaluate_where(expr->left,  row, left_schema, right_schema, cache, outer,
+                                   left_alias, right_alias) &&
+                   evaluate_where(expr->right, row, left_schema, right_schema, cache, outer,
+                                   left_alias, right_alias);
         case LogicalOp::OR:
-            return evaluate_where(expr->left,  row, left_schema, right_schema, cache) ||
-                   evaluate_where(expr->right, row, left_schema, right_schema, cache);
+            return evaluate_where(expr->left,  row, left_schema, right_schema, cache, outer,
+                                   left_alias, right_alias) ||
+                   evaluate_where(expr->right, row, left_schema, right_schema, cache, outer,
+                                   left_alias, right_alias);
         case LogicalOp::NOT:
-            return !evaluate_where(expr->left, row, left_schema, right_schema, cache);
+            return !evaluate_where(expr->left, row, left_schema, right_schema, cache, outer,
+                                    left_alias, right_alias);
     }
     return false;
 }
@@ -664,20 +687,24 @@ bool Executor::evaluate_compare(const CompareExpr&   expr,
                                  const Row&            row,
                                  const TableSchema&    left_schema,
                                  const TableSchema*    right_schema,
-                                 const SubqueryCache*  cache) const
+                                 const SubqueryCache*  cache,
+                                 const OuterContext*   outer,
+                                 const std::string&    left_alias,
+                                 const std::string&    right_alias) const
 {
-    size_t col_idx = right_schema
-        ? resolve_column(expr.column, left_schema, *right_schema)
-        : resolve_column(expr.column, left_schema);
-    const Value& val = row.get(col_idx);
+    // resolve_value tries left_schema/right_schema first, then falls back to
+    // 'outer' if given — that fallback is what makes a correlated subquery's
+    // WHERE able to see a column from the outer row.
+    const Value& val = resolve_value(expr.column, row, left_schema, right_schema, outer,
+                                      left_alias, right_alias);
 
     // IS NULL / IS NOT NULL do not examine the operand
     if (expr.op == CompareOp::IS_NULL)     return  is_null(val);
     if (expr.op == CompareOp::IS_NOT_NULL) return !is_null(val);
 
-    // column [NOT] IN (SELECT ...) — uses the precomputed candidate set,
-    // not expr.operand, so this must be handled before the generic
-    // null-operand check below (expr.operand is unused/default for these).
+    // column [NOT] IN (SELECT ...) — uses the precomputed (or, if
+    // correlated, freshly-run-for-this-row) candidate set, not expr.operand,
+    // so this must be handled before the generic null-operand check below.
     if (expr.op == CompareOp::IN_SUBQUERY || expr.op == CompareOp::NOT_IN_SUBQUERY) {
         if (!cache) {
             throw std::runtime_error(
@@ -686,10 +713,21 @@ bool Executor::evaluate_compare(const CompareExpr&   expr,
         // SQL: x IN (...) / x NOT IN (...) is UNKNOWN (never true) when x is NULL
         if (is_null(val)) return false;
 
-        const std::vector<Value>& candidates = cache->in_values.at(&expr);
+        // Correlated: re-run the inner query for this specific outer row
+        // rather than reusing a cached, once-computed candidate set.
+        std::vector<Value> fresh_candidates;
+        const std::vector<Value>* candidates;
+        if (cache->correlated_in.count(&expr)) {
+            OuterContext this_row{&row, &left_schema, right_schema, left_alias, right_alias};
+            fresh_candidates = run_subquery_values(*expr.subquery, &this_row);
+            candidates = &fresh_candidates;
+        } else {
+            candidates = &cache->in_values.at(&expr);
+        }
+
         bool found    = false;
         bool any_null = false;
-        for (const auto& c : candidates) {
+        for (const auto& c : *candidates) {
             if (is_null(c)) { any_null = true; continue; }
             if (values_equal(val, c)) { found = true; break; }
         }
@@ -707,23 +745,32 @@ bool Executor::evaluate_compare(const CompareExpr&   expr,
         return true;
     }
 
+    // RHS is either another column (orders.user_id = users.id) or a literal
+    // (age > 25). Column-vs-column resolution uses the same outer fallback
+    // as the LHS, so `users.id` on the right resolves against the outer row
+    // exactly the same way `orders.user_id` on the left resolves locally.
+    const Value& rhs = expr.operand_column
+        ? resolve_value(*expr.operand_column, row, left_schema, right_schema, outer,
+                         left_alias, right_alias)
+        : expr.operand;
+
     // SQL NULL semantics: any comparison with NULL yields false
-    if (is_null(val))          return false;
-    if (is_null(expr.operand)) return false;
+    if (is_null(val)) return false;
+    if (is_null(rhs))  return false;
 
     // LIKE — only meaningful for VARCHAR
     if (expr.op == CompareOp::LIKE) {
         if (!std::holds_alternative<std::string>(val) ||
-            !std::holds_alternative<std::string>(expr.operand)) {
+            !std::holds_alternative<std::string>(rhs)) {
             return false;
         }
-        return like_match(get_string(val), get_string(expr.operand));
+        return like_match(get_string(val), get_string(rhs));
     }
 
     // General comparison via std::visit — handles same-type and int/float cross comparisons
-    return std::visit([&](const auto& lhs, const auto& rhs) -> bool {
+    return std::visit([&](const auto& lhs, const auto& rhs_val) -> bool {
         using L = std::decay_t<decltype(lhs)>;
-        using R = std::decay_t<decltype(rhs)>;
+        using R = std::decay_t<decltype(rhs_val)>;
 
         // monostate (NULL) was already filtered above, but guard anyway
         if constexpr (std::is_same_v<L, std::monostate> ||
@@ -736,7 +783,7 @@ bool Executor::evaluate_compare(const CompareExpr&   expr,
                            (std::is_same_v<R, int32_t> || std::is_same_v<R, float>) &&
                            !std::is_same_v<L, R>) {
             float fl = static_cast<float>(lhs);
-            float fr = static_cast<float>(rhs);
+            float fr = static_cast<float>(rhs_val);
             switch (expr.op) {
                 case CompareOp::EQ:  return fl == fr;
                 case CompareOp::NEQ: return fl != fr;
@@ -751,12 +798,12 @@ bool Executor::evaluate_compare(const CompareExpr&   expr,
         // Same-type comparison
         else if constexpr (std::is_same_v<L, R>) {
             switch (expr.op) {
-                case CompareOp::EQ:  return lhs == rhs;
-                case CompareOp::NEQ: return lhs != rhs;
-                case CompareOp::LT:  return lhs <  rhs;
-                case CompareOp::GT:  return lhs >  rhs;
-                case CompareOp::LTE: return lhs <= rhs;
-                case CompareOp::GTE: return lhs >= rhs;
+                case CompareOp::EQ:  return lhs == rhs_val;
+                case CompareOp::NEQ: return lhs != rhs_val;
+                case CompareOp::LT:  return lhs <  rhs_val;
+                case CompareOp::GT:  return lhs >  rhs_val;
+                case CompareOp::LTE: return lhs <= rhs_val;
+                case CompareOp::GTE: return lhs >= rhs_val;
                 default: return false;
             }
         }
@@ -765,32 +812,71 @@ bool Executor::evaluate_compare(const CompareExpr&   expr,
         else {
             return false;
         }
-    }, val, expr.operand);
+    }, val, rhs);
 }
 
 Predicate Executor::build_predicate(const WhereExprPtr& where,
                                      const TableSchema&  schema,
-                                     const TableSchema*  right_schema) const
+                                     const TableSchema*  right_schema,
+                                     const OuterContext* outer,
+                                     const std::string&  left_alias,
+                                     const std::string&  right_alias) const
 {
     if (!where) {
         return [](const Row&) { return true; };
     }
-    // Run any subqueries in 'where' exactly once, up front — not once per
-    // row. shared_ptr keeps the cache alive for as long as the returned
-    // predicate lambda is (it's cheap to copy-capture into the closure).
+    // Run any non-correlated subqueries in 'where' exactly once, up front —
+    // not once per row. shared_ptr keeps the cache alive for as long as the
+    // returned predicate lambda is (it's cheap to copy-capture into the
+    // closure). Correlated subqueries are marked here but actually executed
+    // per-row inside evaluate_where/evaluate_compare.
     auto cache = std::make_shared<SubqueryCache>();
     precompute_subqueries(where, *cache);
 
     // Capture by reference — safe because the predicate is only used within
     // the same execute_*() call frame, which keeps 'where' and 'schema' alive.
-    return [this, &where, &schema, right_schema, cache](const Row& row) {
-        return evaluate_where(where, row, schema, right_schema, cache.get());
+    // 'outer' is captured by value (it's just a pointer) — when this
+    // predicate belongs to a correlated subquery's own scan, it points to
+    // the single outer row this particular scan was run for. left_alias/
+    // right_alias are captured by value (cheap strings) for the same reason.
+    return [this, &where, &schema, right_schema, cache, outer, left_alias, right_alias](const Row& row) {
+        return evaluate_where(where, row, schema, right_schema, cache.get(), outer,
+                               left_alias, right_alias);
     };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Subqueries (IN / NOT IN / EXISTS / NOT EXISTS) — non-correlated
 // ─────────────────────────────────────────────────────────────────────────────
+
+bool Executor::where_references_unknown_column(const WhereExprPtr& expr,
+                                                 const TableSchema&  sub_schema,
+                                                 const std::string&  sub_alias) const
+{
+    if (!expr) return false;
+
+    if (expr->kind == WhereExpr::Kind::LOGICAL) {
+        return where_references_unknown_column(expr->left,  sub_schema, sub_alias) ||
+               where_references_unknown_column(expr->right, sub_schema, sub_alias);
+    }
+
+    if (expr->kind == WhereExpr::Kind::EXISTS) {
+        // A nested EXISTS's own correlation (if any) is against ITS
+        // immediate parent schema, handled when precompute_subqueries
+        // recurses into it separately — not something that makes the
+        // current subquery correlated by itself.
+        return false;
+    }
+
+    // COMPARE node — check both sides. expr.column not resolving locally
+    // means it must be an outer column (or a genuine typo, which surfaces
+    // as an "unknown column" error at runtime when the outer fallback also
+    // fails to find it — same failure mode as today, just later).
+    const CompareExpr& c = expr->compare;
+    if (!try_resolve_column(c.column, sub_schema, sub_alias).has_value()) return true;
+    if (c.operand_column && !try_resolve_column(*c.operand_column, sub_schema, sub_alias).has_value()) return true;
+    return false;
+}
 
 void Executor::precompute_subqueries(const WhereExprPtr& expr, SubqueryCache& cache) const
 {
@@ -803,6 +889,14 @@ void Executor::precompute_subqueries(const WhereExprPtr& expr, SubqueryCache& ca
     }
 
     if (expr->kind == WhereExpr::Kind::EXISTS) {
+        const TableSchema& sub_schema = catalog_.get_table(expr->subquery->table_name);
+        if (where_references_unknown_column(expr->subquery->where, sub_schema,
+                                             expr->subquery->table_alias)) {
+            // Correlated — mark it, don't run it. Actual execution happens
+            // per outer row in evaluate_where.
+            cache.correlated_exists.insert(expr.get());
+            return;
+        }
         bool non_empty = !run_subquery_scan(*expr->subquery).empty();
         cache.exists_results[expr.get()] = non_empty;
         return;
@@ -811,11 +905,18 @@ void Executor::precompute_subqueries(const WhereExprPtr& expr, SubqueryCache& ca
     // COMPARE — only IN_SUBQUERY / NOT_IN_SUBQUERY carry a subquery to run
     if (expr->compare.op == CompareOp::IN_SUBQUERY ||
         expr->compare.op == CompareOp::NOT_IN_SUBQUERY) {
+        const TableSchema& sub_schema = catalog_.get_table(expr->compare.subquery->table_name);
+        if (where_references_unknown_column(expr->compare.subquery->where, sub_schema,
+                                             expr->compare.subquery->table_alias)) {
+            cache.correlated_in.insert(&expr->compare);
+            return;
+        }
         cache.in_values[&expr->compare] = run_subquery_values(*expr->compare.subquery);
     }
 }
 
-std::vector<ScanResult> Executor::run_subquery_scan(const SelectStmt& subquery) const
+std::vector<ScanResult> Executor::run_subquery_scan(const SelectStmt&    subquery,
+                                                      const OuterContext* outer) const
 {
     if (!subquery.joins.empty()) {
         throw std::runtime_error(
@@ -827,7 +928,11 @@ std::vector<ScanResult> Executor::run_subquery_scan(const SelectStmt& subquery) 
 
     // build_predicate() recursively precomputes any subqueries nested
     // inside this subquery's own WHERE, so IN/EXISTS nesting just works.
-    Predicate pred = build_predicate(subquery.where, sub_schema);
+    // 'outer' is forwarded so THIS subquery's own WHERE can, in turn,
+    // resolve a column against outer's outer row if it needs to (arbitrary
+    // correlation depth works the same way one level deep does).
+    Predicate pred = build_predicate(subquery.where, sub_schema, nullptr, outer,
+                                      subquery.table_alias);
     std::vector<ScanResult> rows = sub_tbl.scan(pred);
 
     if (subquery.limit.has_value()) {
@@ -837,21 +942,24 @@ std::vector<ScanResult> Executor::run_subquery_scan(const SelectStmt& subquery) 
     return rows;
 }
 
-std::vector<Value> Executor::run_subquery_values(const SelectStmt& subquery) const
+std::vector<Value> Executor::run_subquery_values(const SelectStmt&    subquery,
+                                                   const OuterContext* outer) const
 {
     if (subquery.columns.size() != 1 ||
         subquery.columns[0].is_star ||
+        subquery.columns[0].is_literal ||
         subquery.columns[0].aggregate != AggregateType::NONE) {
         throw std::runtime_error(
             "a subquery used with IN / NOT IN must select exactly one plain "
-            "column (SELECT * and aggregate subqueries are not supported yet)");
+            "column (SELECT *, SELECT <literal>, and aggregate subqueries "
+            "are not supported here)");
     }
 
     const TableSchema& sub_schema = catalog_.get_table(subquery.table_name);
-    size_t col_idx = resolve_column(subquery.columns[0].column, sub_schema);
+    size_t col_idx = resolve_column(subquery.columns[0].column, sub_schema, subquery.table_alias);
 
     std::vector<Value> values;
-    for (const auto& sr : run_subquery_scan(subquery)) {
+    for (const auto& sr : run_subquery_scan(subquery, outer)) {
         values.push_back(sr.row.get(col_idx));
     }
     return values;
@@ -936,6 +1044,10 @@ void Executor::flatten_check_expr(const WhereExprPtr&           expr,
 
     // COMPARE leaf: column OP literal
     const CompareExpr& cmp = expr->compare;
+    if (cmp.operand_column.has_value()) {
+        throw std::runtime_error(
+            "CHECK constraints must compare a column against a literal, not another column");
+    }
     if (!cmp.column.table_name.empty()) {
         throw std::runtime_error(
             "CHECK constraint column references must be unqualified: '" +
@@ -981,11 +1093,101 @@ int Executor::find_violated_check(const TableSchema& schema, const Row& row) con
 // Column resolution
 // ─────────────────────────────────────────────────────────────────────────────
 
-size_t Executor::resolve_column(const ColumnRef&   ref,
-                                 const TableSchema& schema) const
+bool Executor::table_name_matches(const std::string& ref_table,
+                                   const TableSchema& schema,
+                                   const std::string& alias) const
 {
-    // If the column ref is table-qualified, it must match this schema's name
-    if (!ref.table_name.empty() && ref.table_name != schema.name) {
+    return ref_table == schema.name || (!alias.empty() && ref_table == alias);
+}
+
+std::optional<size_t> Executor::try_resolve_column(const ColumnRef&   ref,
+                                                    const TableSchema& schema,
+                                                    const std::string& alias) const
+{
+    if (!ref.table_name.empty() && !table_name_matches(ref.table_name, schema, alias))
+        return std::nullopt;
+    int idx = schema.column_index(ref.column_name);
+    if (idx < 0) return std::nullopt;
+    return static_cast<size_t>(idx);
+}
+
+std::optional<size_t> Executor::try_resolve_column(const ColumnRef&   ref,
+                                                    const TableSchema& left_schema,
+                                                    const TableSchema& right_schema,
+                                                    const std::string& left_alias,
+                                                    const std::string& right_alias) const
+{
+    const size_t left_width = left_schema.columns.size();
+
+    if (!ref.table_name.empty()) {
+        if (table_name_matches(ref.table_name, left_schema, left_alias)) {
+            int idx = left_schema.column_index(ref.column_name);
+            return idx < 0 ? std::nullopt : std::optional<size_t>(static_cast<size_t>(idx));
+        }
+        if (table_name_matches(ref.table_name, right_schema, right_alias)) {
+            int idx = right_schema.column_index(ref.column_name);
+            return idx < 0 ? std::nullopt : std::optional<size_t>(left_width + static_cast<size_t>(idx));
+        }
+        return std::nullopt;
+    }
+
+    int left_idx  = left_schema.column_index(ref.column_name);
+    int right_idx = right_schema.column_index(ref.column_name);
+    if (left_idx >= 0 && right_idx >= 0) {
+        throw std::runtime_error(
+            "Ambiguous column '" + ref.column_name +
+            "' exists in both '" + left_schema.name +
+            "' and '" + right_schema.name +
+            "' — qualify with table name");
+    }
+    if (left_idx  >= 0) return static_cast<size_t>(left_idx);
+    if (right_idx >= 0) return left_width + static_cast<size_t>(right_idx);
+    return std::nullopt;
+}
+
+const Value& Executor::resolve_value(const ColumnRef&    ref,
+                                      const Row&           row,
+                                      const TableSchema&   schema,
+                                      const TableSchema*   right_schema,
+                                      const OuterContext*  outer,
+                                      const std::string&   left_alias,
+                                      const std::string&   right_alias) const
+{
+    // Try the local (current query's own) schema(s) first.
+    if (right_schema) {
+        if (auto idx = try_resolve_column(ref, schema, *right_schema, left_alias, right_alias))
+            return row.get(*idx);
+    } else {
+        if (auto idx = try_resolve_column(ref, schema, left_alias)) return row.get(*idx);
+    }
+
+    // Not found locally — fall back to the outer row. This is the entire
+    // correlated-subquery mechanism: a WHERE clause inside a subquery that
+    // mentions a column not in the subquery's own table falls through to
+    // whichever outer row is currently being checked.
+    if (outer) {
+        if (outer->right_schema) {
+            if (auto idx = try_resolve_column(ref, *outer->schema, *outer->right_schema,
+                                               outer->alias, outer->right_alias))
+                return outer->row->get(*idx);
+        } else {
+            if (auto idx = try_resolve_column(ref, *outer->schema, outer->alias))
+                return outer->row->get(*idx);
+        }
+    }
+
+    throw std::runtime_error(
+        "Unknown column '" + ref.column_name + "'" +
+        (ref.table_name.empty() ? "" : " (qualified with '" + ref.table_name + "')"));
+}
+
+size_t Executor::resolve_column(const ColumnRef&   ref,
+                                 const TableSchema& schema,
+                                 const std::string& alias) const
+{
+    // If the column ref is table-qualified, it must match this schema's
+    // name or its query alias (if any).
+    if (!ref.table_name.empty() && !table_name_matches(ref.table_name, schema, alias)) {
         throw std::runtime_error(
             "Column '" + ref.column_name +
             "' is qualified with table '" + ref.table_name +
@@ -1001,20 +1203,22 @@ size_t Executor::resolve_column(const ColumnRef&   ref,
 
 size_t Executor::resolve_column(const ColumnRef&   ref,
                                  const TableSchema& left_schema,
-                                 const TableSchema& right_schema) const
+                                 const TableSchema& right_schema,
+                                 const std::string& left_alias,
+                                 const std::string& right_alias) const
 {
     const size_t left_width = left_schema.columns.size();
 
     if (!ref.table_name.empty()) {
-        // Qualified reference — must match exactly one table's name
-        if (ref.table_name == left_schema.name) {
+        // Qualified reference — must match exactly one table's name or alias
+        if (table_name_matches(ref.table_name, left_schema, left_alias)) {
             int idx = left_schema.column_index(ref.column_name);
             if (idx < 0)
                 throw std::runtime_error("Unknown column '" + ref.column_name +
                                          "' in table '" + left_schema.name + "'");
             return static_cast<size_t>(idx);
         }
-        if (ref.table_name == right_schema.name) {
+        if (table_name_matches(ref.table_name, right_schema, right_alias)) {
             int idx = right_schema.column_index(ref.column_name);
             if (idx < 0)
                 throw std::runtime_error("Unknown column '" + ref.column_name +
@@ -1082,7 +1286,9 @@ std::vector<std::string> Executor::build_column_headers(
     std::vector<std::string> headers;
     headers.reserve(select_cols.size());
     for (const auto& sc : select_cols) {
-        headers.push_back(sc.column.column_name);
+        // Header for a literal projection is its own text, e.g. `SELECT 1`
+        // gets header "1" — matches how most SQL engines display it.
+        headers.push_back(sc.is_literal ? value_to_string(sc.literal) : sc.column.column_name);
     }
     return headers;
 }
@@ -1091,7 +1297,9 @@ std::vector<std::string> Executor::project_row(
     const std::vector<SelectColumn>& select_cols,
     const Row&                       row,
     const TableSchema&               schema,
-    const TableSchema*               joined_schema) const
+    const TableSchema*               joined_schema,
+    const std::string&               left_alias,
+    const std::string&               right_alias) const
 {
     // For JOIN queries, 'row' is the combined row (left cols + right cols).
     // 'joined_schema' is the right-side schema for column name resolution.
@@ -1110,18 +1318,23 @@ std::vector<std::string> Executor::project_row(
     out.reserve(select_cols.size());
 
     for (const auto& sc : select_cols) {
+        if (sc.is_literal) {
+            out.push_back(value_to_string(sc.literal));
+            continue;
+        }
+
         const std::string& col_name   = sc.column.column_name;
         const std::string& table_qual = sc.column.table_name;
 
-        // ── Qualified reference with explicit table name ───────────────────
+        // ── Qualified reference with explicit table name (or alias) ────────
         if (!table_qual.empty()) {
-            if (table_qual == schema.name) {
+            if (table_name_matches(table_qual, schema, left_alias)) {
                 int idx = schema.column_index(col_name);
                 if (idx < 0) throw std::runtime_error("SELECT: unknown column '" + col_name + "'");
                 out.push_back(value_to_string(row.get(static_cast<size_t>(idx))));
                 continue;
             }
-            if (joined_schema && table_qual == joined_schema->name) {
+            if (joined_schema && table_name_matches(table_qual, *joined_schema, right_alias)) {
                 int idx = joined_schema->column_index(col_name);
                 if (idx < 0) throw std::runtime_error("SELECT: unknown column '" + col_name + "'");
                 size_t combined_idx = schema.columns.size() + static_cast<size_t>(idx);

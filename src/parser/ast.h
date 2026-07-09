@@ -49,7 +49,13 @@ enum class CompareOp {
 struct CompareExpr {
     ColumnRef column;
     CompareOp op = CompareOp::EQ;
-    Value     operand;   // not used for IS_NULL / IS_NOT_NULL / *_SUBQUERY
+    Value     operand;   // used when the RHS is a literal; not used for IS_NULL / IS_NOT_NULL / *_SUBQUERY
+    std::optional<ColumnRef> operand_column;  // used when the RHS is itself a column, e.g.
+                                               // `orders.user_id = users.id`. Mutually exclusive
+                                               // with 'operand' — if set, 'operand' is ignored.
+                                               // This is what makes correlated subqueries expressible:
+                                               // the inner query's WHERE can reference a column that
+                                               // only resolves against the outer row.
     std::unique_ptr<SelectStmt> subquery;  // only used for IN_SUBQUERY / NOT_IN_SUBQUERY
 };
 
@@ -88,10 +94,15 @@ struct WhereExpr {
 // not meaningful — that's exactly what GROUP BY exists to make meaningful).
 enum class AggregateType { NONE, COUNT_STAR, COUNT_COLUMN };
 
-// A selected column: *, name, users.name, COUNT(*), COUNT(name)
+// A selected column: *, name, users.name, COUNT(*), COUNT(name), or a bare
+// literal (1, 'x', TRUE, NULL) — most commonly seen as `SELECT 1` in an
+// EXISTS subquery, where the projected value is irrelevant and only
+// row-presence matters.
 struct SelectColumn {
     bool          is_star   = false;    // SELECT *
-    ColumnRef     column;               // used if not star, or if aggregate == COUNT_COLUMN
+    bool          is_literal = false;   // SELECT 1 / SELECT 'x' / SELECT NULL ...
+    Value         literal;              // used if is_literal
+    ColumnRef     column;               // used if not star/literal, or if aggregate == COUNT_COLUMN
     AggregateType aggregate = AggregateType::NONE;
 };
 

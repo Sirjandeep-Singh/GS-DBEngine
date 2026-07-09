@@ -7,8 +7,8 @@
 //       src/btree/free_list_manager.cpp \
 //       src/catalog/catalog_manager.cpp src/storage/disk_manager.cpp \
 //       src/header/header_manager.cpp src/storage/buffer_pool.cpp \
-//       src/wal/wal_manager.cpp -Isrc -o gsdb && ./gsdb
-//
+//       src/wal/wal_manager.cpp -Isrc -o gsdb_temp && ./gsdb_temp
+
 // Usage:
 //   ./gsdb              — interactive REPL
 //   ./gsdb < file.sql   — pipe a SQL script
@@ -101,6 +101,12 @@ static bool has_terminator(const std::string& input)
     bool in_string = false;
     for (size_t i = 0; i < input.size(); ++i) {
         char c = input[i];
+        if (!in_string && c == '-' && i + 1 < input.size() && input[i + 1] == '-') {
+            // skip to end of line — a '-- comment' isn't SQL, so quotes
+            // and semicolons inside it must not affect statement splitting
+            while (i < input.size() && input[i] != '\n') ++i;
+            continue;
+        }
         if (c == '\'' && !in_string) {
             in_string = true;
         } else if (c == '\'' && in_string) {

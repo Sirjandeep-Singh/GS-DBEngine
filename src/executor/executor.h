@@ -4,6 +4,8 @@
 #include <vector>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
+#include <optional>
 
 #include "../parser/ast.h"
 #include "../catalog/catalog_manager.h"
@@ -76,11 +78,34 @@ private:
 
     // ── Subqueries (IN / NOT IN / EXISTS / NOT EXISTS) ──────────────────────
     //
-    // v1 scope: non-correlated only — the subquery doesn't reference any
-    // column from the outer row, so it's the same result for every outer
-    // row. It's executed exactly once per statement (in precompute_subqueries,
-    // before scanning), not once per row — re-running an identical query
-    // per row would be a correctness-preserving but needlessly slow choice.
+    // Two kinds, distinguished per-node by precompute_subqueries:
+    //
+    // - Non-correlated: the subquery doesn't reference any column from the
+    //   outer row, so it's the same result for every outer row. Executed
+    //   exactly once per statement (in precompute_subqueries, before
+    //   scanning) and cached — re-running an identical query per row would
+    //   be a correctness-preserving but needlessly slow choice.
+    //
+    // - Correlated: the subquery's own WHERE references a column that isn't
+    //   part of its own table (e.g. `EXISTS (SELECT 1 FROM orders WHERE
+    //   orders.user_id = users.id)` — `users.id` only means something for
+    //   "whichever outer row we're currently checking"). Its result can
+    //   differ per outer row, so it CANNOT be cached — precompute_subqueries
+    //   detects this case and marks it instead of computing it; the actual
+    //   re-execution happens per-row in evaluate_where/evaluate_compare,
+    //   with the current outer row threaded down via OuterContext.
+
+    // Identifies the outer row a nested subquery's WHERE clause may need to
+    // fall back to when a column isn't found in the subquery's own schema.
+    // Passed down through build_predicate/evaluate_where/evaluate_compare
+    // only when evaluating a correlated subquery; nullptr everywhere else.
+    struct OuterContext {
+        const Row*         row;
+        const TableSchema* schema;
+        const TableSchema* right_schema = nullptr;  // non-null if the outer query is itself a JOIN
+        std::string        alias;                   // outer query's table alias, "" if none
+        std::string        right_alias;              // outer query's JOIN alias, "" if none
+    };
 
     // Cache of pre-computed subquery results for one WHERE tree, keyed by
     // the address of the AST node that owns the subquery. Node addresses
@@ -88,23 +113,38 @@ private:
     // heap-allocated once via unique_ptr and never copied or moved after
     // parsing, so &node stays valid as long as the AST does.
     struct SubqueryCache {
-        std::unordered_map<const CompareExpr*, std::vector<Value>> in_values;      // IN_SUBQUERY / NOT_IN_SUBQUERY
-        std::unordered_map<const WhereExpr*,    bool>              exists_results; // EXISTS
+        std::unordered_map<const CompareExpr*, std::vector<Value>> in_values;      // IN_SUBQUERY / NOT_IN_SUBQUERY (non-correlated)
+        std::unordered_map<const WhereExpr*,    bool>              exists_results; // EXISTS (non-correlated)
+        std::unordered_set<const CompareExpr*>  correlated_in;      // IN_SUBQUERY / NOT_IN_SUBQUERY (correlated — re-run per row)
+        std::unordered_set<const WhereExpr*>    correlated_exists;  // EXISTS (correlated — re-run per row)
     };
 
-    // Walks a WHERE tree and runs every subquery it contains exactly once,
-    // storing results in cache. A no-op for any subtree with no subqueries.
+    // Walks a subquery's own WHERE tree and returns true if any ColumnRef in
+    // it (LHS or RHS) does NOT resolve against sub_schema — meaning it must
+    // refer to a column from an outer query. Used once per subquery node by
+    // precompute_subqueries to decide cache-once vs. re-run-per-row.
+    bool where_references_unknown_column(const WhereExprPtr& expr,
+                                          const TableSchema&  sub_schema,
+                                          const std::string&  sub_alias = "") const;
+
+    // Walks a WHERE tree and runs every non-correlated subquery it contains
+    // exactly once, storing results in cache. Correlated subqueries are
+    // marked in cache but not executed here. A no-op for any subtree with
+    // no subqueries.
     void precompute_subqueries(const WhereExprPtr& expr, SubqueryCache& cache) const;
 
     // Runs a subquery SELECT (no JOIN, no aggregate — v1 scope) and returns
     // its raw scan results. Honors the subquery's own WHERE (recursively,
     // via build_predicate) and LIMIT; ignores ORDER BY (irrelevant for
-    // set membership / existence checks).
-    std::vector<ScanResult> run_subquery_scan(const SelectStmt& subquery) const;
+    // set membership / existence checks). 'outer' is non-null when this is
+    // a correlated subquery being re-run for one specific outer row.
+    std::vector<ScanResult> run_subquery_scan(const SelectStmt&    subquery,
+                                               const OuterContext* outer = nullptr) const;
 
     // Runs a subquery for IN/NOT IN — requires exactly one plain (non-star,
     // non-aggregate) selected column, and returns that column's values.
-    std::vector<Value> run_subquery_values(const SelectStmt& subquery) const;
+    std::vector<Value> run_subquery_values(const SelectStmt&    subquery,
+                                            const OuterContext* outer = nullptr) const;
 
     // Type-aware equality (int/float promotion, like evaluate_compare's EQ)
     // used to test row values against a precomputed IN candidate set.
@@ -117,27 +157,75 @@ private:
     // right_schema is non-null for JOIN queries — enables two-schema column resolution.
     // cache holds pre-computed subquery results (see precompute_subqueries) —
     // required (non-null) if expr contains any IN-subquery or EXISTS node.
+    // outer is non-null only while evaluating inside a correlated subquery's
+    // own WHERE — it lets column resolution fall back to the outer row.
     bool evaluate_where(const WhereExprPtr&  expr,
                         const Row&           row,
                         const TableSchema&   left_schema,
                         const TableSchema*   right_schema = nullptr,
-                        const SubqueryCache* cache         = nullptr) const;
+                        const SubqueryCache* cache         = nullptr,
+                        const OuterContext*  outer         = nullptr,
+                        const std::string&   left_alias    = "",
+                        const std::string&   right_alias   = "") const;
 
     // Evaluates a single CompareExpr leaf node against a row.
     bool evaluate_compare(const CompareExpr&   expr,
                           const Row&           row,
                           const TableSchema&   left_schema,
                           const TableSchema*   right_schema = nullptr,
-                          const SubqueryCache* cache         = nullptr) const;
+                          const SubqueryCache* cache         = nullptr,
+                          const OuterContext*  outer         = nullptr,
+                          const std::string&   left_alias    = "",
+                          const std::string&   right_alias   = "") const;
 
     // Returns a Predicate that wraps evaluate_where().
     // If where is nullptr, returns a predicate that always returns true.
-    // right_schema is non-null for JOIN queries. Precomputes any subqueries
-    // in 'where' exactly once and keeps the cache alive for the predicate's
-    // lifetime (captured by shared_ptr in the returned lambda).
+    // right_schema is non-null for JOIN queries. Precomputes any non-correlated
+    // subqueries in 'where' exactly once and keeps the cache alive for the
+    // predicate's lifetime (captured by shared_ptr in the returned lambda).
+    // outer is forwarded through when this predicate is itself being built
+    // for a correlated subquery's own scan (see run_subquery_scan).
     Predicate build_predicate(const WhereExprPtr& where,
                               const TableSchema&  schema,
-                              const TableSchema*  right_schema = nullptr) const;
+                              const TableSchema*  right_schema = nullptr,
+                              const OuterContext* outer        = nullptr,
+                              const std::string&  left_alias   = "",
+                              const std::string&  right_alias  = "") const;
+
+    // Resolves a ColumnRef to a value against the current row, trying the
+    // local schema(s) first and falling back to 'outer' (if provided) when
+    // the column isn't found locally. This fallback is the entire mechanism
+    // behind correlated subqueries — nothing more exotic than "if it's not
+    // in my row, check the outer one."
+    const Value& resolve_value(const ColumnRef&    ref,
+                               const Row&           row,
+                               const TableSchema&   schema,
+                               const TableSchema*   right_schema,
+                               const OuterContext*  outer,
+                               const std::string&   left_alias  = "",
+                               const std::string&   right_alias = "") const;
+
+    // Non-throwing column lookups, used by resolve_value's fallback chain
+    // and by where_references_unknown_column for correlation detection.
+    // 'alias' is the query's table alias for 'schema' (e.g. the "o" in
+    // "FROM orders o"), if any — a qualified ref matches on either the
+    // alias or the real table name.
+    std::optional<size_t> try_resolve_column(const ColumnRef&   ref,
+                                             const TableSchema& schema,
+                                             const std::string& alias = "") const;
+    std::optional<size_t> try_resolve_column(const ColumnRef&   ref,
+                                             const TableSchema& left_schema,
+                                             const TableSchema& right_schema,
+                                             const std::string& left_alias  = "",
+                                             const std::string& right_alias = "") const;
+
+    // True if 'ref_table' (a qualified column's table-name part) refers to
+    // 'schema' — either by its real catalog name or by the query-supplied
+    // alias. Centralizes the "alias OR real name" check used throughout
+    // column resolution.
+    bool table_name_matches(const std::string& ref_table,
+                             const TableSchema& schema,
+                             const std::string& alias) const;
 
     // ── JOIN ─────────────────────────────────────────────────────────────────
 
@@ -156,21 +244,26 @@ private:
         const TableSchema&             left_schema,
         Table&                         right_table,
         const TableSchema&             right_schema,
-        const JoinClause&              join) const;
+        const JoinClause&              join,
+        const std::string&             left_alias  = "",
+        const std::string&             right_alias = "") const;
 
     // ── Column resolution ────────────────────────────────────────────────────
 
     // Returns the zero-based column index for ref in schema.
     // Throws if the column is not found or the table qualifier doesn't match.
     size_t resolve_column(const ColumnRef&   ref,
-                          const TableSchema& schema) const;
+                          const TableSchema& schema,
+                          const std::string& alias = "") const;
 
     // Two-schema overload for JOIN queries.
-    // Qualified refs are checked against the correct table name.
+    // Qualified refs are checked against the correct table name (or alias).
     // Unqualified refs search both schemas and throw on ambiguity.
     size_t resolve_column(const ColumnRef&   ref,
                           const TableSchema& left_schema,
-                          const TableSchema& right_schema) const;
+                          const TableSchema& right_schema,
+                          const std::string& left_alias  = "",
+                          const std::string& right_alias = "") const;
 
     // ── CREATE TABLE helpers ─────────────────────────────────────────────────
 
@@ -212,9 +305,13 @@ private:
 
     // Projects the SELECT column list from a row to strings.
     // joined_row and joined_schema are provided for JOIN results.
+    // left_alias/right_alias let a qualified SELECT column (e.g. "c.name")
+    // match a query alias, not just the real table name.
     std::vector<std::string> project_row(
         const std::vector<SelectColumn>& select_cols,
         const Row&                       row,
         const TableSchema&               schema,
-        const TableSchema*               joined_schema = nullptr) const;
+        const TableSchema*               joined_schema = nullptr,
+        const std::string&               left_alias    = "",
+        const std::string&               right_alias   = "") const;
 };
