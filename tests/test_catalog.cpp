@@ -21,9 +21,9 @@ void cleanup() {
 // helper — builds a simple users table schema
 TableSchema make_users_schema(uint32_t root_page = INVALID_PAGE) {
     TableSchema schema;
-    schema.name             = "users";
-    schema.root_page        = root_page;
-    schema.primary_key_index = 0;
+    schema.name              = "users";
+    schema.root_page         = root_page;
+    schema.primary_key_indices = {0};
 
     Column id;
     id.name           = "id";
@@ -58,7 +58,7 @@ TableSchema make_orders_schema(uint32_t root_page = INVALID_PAGE) {
     TableSchema schema;
     schema.name              = "orders";
     schema.root_page         = root_page;
-    schema.primary_key_index = 0;
+    schema.primary_key_indices = {0};
 
     Column id;
     id.name           = "id";

@@ -12,7 +12,7 @@ TableSchema make_users_schema() {
     TableSchema schema;
     schema.name              = "users";
     schema.root_page         = 0;
-    schema.primary_key_index = 0;
+    schema.primary_key_indices = {0};
 
     Column id;
     id.name           = "id";
@@ -55,7 +55,7 @@ TableSchema make_products_schema() {
     TableSchema schema;
     schema.name              = "products";
     schema.root_page         = 0;
-    schema.primary_key_index = 0;
+    schema.primary_key_indices = {0};
 
     Column id;
     id.name           = "id";

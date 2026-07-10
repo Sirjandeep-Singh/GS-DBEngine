@@ -27,7 +27,7 @@ TableSchema make_users_schema(uint32_t root_page = INVALID_PAGE) {
     TableSchema schema;
     schema.name              = "users";
     schema.root_page         = root_page;
-    schema.primary_key_index = 0;
+    schema.primary_key_indices = {0};
 
     Column id;
     id.name = "id"; id.type = ColumnType::INT;
@@ -89,6 +89,12 @@ Row make_user_null_id(const std::string& name, int32_t age, bool active) {
     return row;
 }
 
+// helper — builds a single-column primary Key from an int, for the
+// users schema's INT primary key (id).
+Key pk(int32_t id) {
+    return Key{Value(id)};
+}
+
 // ─────────────────────────────────────────────
 // INSERT Tests
 // ─────────────────────────────────────────────
@@ -100,8 +106,8 @@ void test_insert_explicit_key() {
     Table table(schema, env.bp, env.wal, env.fl);
 
     Row row = make_user(1, "Alice", 25, true);
-    uint32_t key = table.insert(row);
-    assert(key == 1);
+    Key key = table.insert(row);
+    assert(key == pk(1));
 
     std::cout << "[PASS] insert with explicit primary key returns correct key\n";
     cleanup();
@@ -117,13 +123,13 @@ void test_insert_auto_increment() {
     Row r2 = make_user_null_id("Bob", 30, false);
     Row r3 = make_user_null_id("Carol", 22, true);
 
-    uint32_t k1 = table.insert(r1);
-    uint32_t k2 = table.insert(r2);
-    uint32_t k3 = table.insert(r3);
+    Key k1 = table.insert(r1);
+    Key k2 = table.insert(r2);
+    Key k3 = table.insert(r3);
 
-    assert(k1 == 1);
-    assert(k2 == 2);
-    assert(k3 == 3);
+    assert(k1 == pk(1));
+    assert(k2 == pk(2));
+    assert(k3 == pk(3));
 
     std::cout << "[PASS] auto-increment assigns sequential keys\n";
     cleanup();
@@ -164,7 +170,7 @@ void test_select_by_key_found() {
     Row row = make_user(1, "Alice", 25, true);
     table.insert(row);
 
-    auto result = table.select_by_key(1);
+    auto result = table.select_by_key(pk(1));
     assert(result.has_value());
     assert(get_string(result->get(1)) == "Alice");
     assert(get_int(result->get(2))    == 25);
@@ -180,7 +186,7 @@ void test_select_by_key_not_found() {
     TableSchema schema = make_users_schema();
     Table table(schema, env.bp, env.wal, env.fl);
 
-    auto result = table.select_by_key(999);
+    auto result = table.select_by_key(pk(999));
     assert(!result.has_value());
 
     std::cout << "[PASS] select_by_key returns nullopt for missing key\n";
@@ -202,9 +208,9 @@ void test_scan_all_rows() {
 
     auto results = table.scan([](const Row&) { return true; });
     assert(results.size() == 3);
-    assert(results[0].primary_key == 1);
-    assert(results[1].primary_key == 2);
-    assert(results[2].primary_key == 3);
+    assert(results[0].primary_key == pk(1));
+    assert(results[1].primary_key == pk(2));
+    assert(results[2].primary_key == pk(3));
 
     std::cout << "[PASS] scan returns all rows in primary key order\n";
     cleanup();
@@ -247,7 +253,7 @@ void test_scan_with_null_column() {
     table.insert(r1);
     table.insert(r2);
 
-    auto result = table.select_by_key(2);
+    auto result = table.select_by_key(pk(2));
     assert(result.has_value());
     assert(is_null(result->get(2)));
 
@@ -268,9 +274,9 @@ void test_update_single_column() {
     table.insert(make_user(1, "Alice", 25, true));
 
     // update age to 26
-    table.update(1, {{2, Value(int32_t(26))}});
+    table.update(pk(1), {{2, Value(int32_t(26))}});
 
-    auto result = table.select_by_key(1);
+    auto result = table.select_by_key(pk(1));
     assert(result.has_value());
     assert(get_int(result->get(2)) == 26);
     assert(get_string(result->get(1)) == "Alice");  // unchanged
@@ -287,12 +293,12 @@ void test_update_multiple_columns() {
 
     table.insert(make_user(1, "Alice", 25, true));
 
-    table.update(1, {
+    table.update(pk(1), {
         {1, Value(std::string("Alicia"))},
         {3, Value(bool(false))}
     });
 
-    auto result = table.select_by_key(1);
+    auto result = table.select_by_key(pk(1));
     assert(result.has_value());
     assert(get_string(result->get(1)) == "Alicia");
     assert(get_bool(result->get(3))   == false);
@@ -310,7 +316,7 @@ void test_update_nonexistent_key_throws() {
 
     bool threw = false;
     try {
-        table.update(999, {{2, Value(int32_t(30))}});
+        table.update(pk(999), {{2, Value(int32_t(30))}});
     } catch (const std::runtime_error&) {
         threw = true;
     }
@@ -330,7 +336,7 @@ void test_update_primary_key_throws() {
 
     bool threw = false;
     try {
-        table.update(1, {{0, Value(int32_t(99))}});  // col 0 = primary key
+        table.update(pk(1), {{0, Value(int32_t(99))}});  // col 0 = primary key
     } catch (const std::runtime_error&) {
         threw = true;
     }
@@ -351,10 +357,10 @@ void test_delete_row() {
     Table table(schema, env.bp, env.wal, env.fl);
 
     table.insert(make_user(1, "Alice", 25, true));
-    assert(table.select_by_key(1).has_value());
+    assert(table.select_by_key(pk(1)).has_value());
 
-    table.delete_row(1);
-    assert(!table.select_by_key(1).has_value());
+    table.delete_row(pk(1));
+    assert(!table.select_by_key(pk(1)).has_value());
 
     std::cout << "[PASS] delete_row removes the row correctly\n";
     cleanup();
@@ -368,7 +374,7 @@ void test_delete_nonexistent_key_throws() {
 
     bool threw = false;
     try {
-        table.delete_row(999);
+        table.delete_row(pk(999));
     } catch (const std::runtime_error&) {
         threw = true;
     }
@@ -395,10 +401,10 @@ void test_delete_where() {
     });
 
     assert(count == 2);
-    assert(!table.select_by_key(2).has_value());
-    assert(!table.select_by_key(4).has_value());
-    assert(table.select_by_key(1).has_value());
-    assert(table.select_by_key(3).has_value());
+    assert(!table.select_by_key(pk(2)).has_value());
+    assert(!table.select_by_key(pk(4)).has_value());
+    assert(table.select_by_key(pk(1)).has_value());
+    assert(table.select_by_key(pk(3)).has_value());
 
     std::cout << "[PASS] delete_where deletes only matching rows\n";
     cleanup();
@@ -422,9 +428,9 @@ void test_update_where() {
 
     assert(count == 2);
 
-    auto alice = table.select_by_key(1);
-    auto bob   = table.select_by_key(2);
-    auto carol = table.select_by_key(3);
+    auto alice = table.select_by_key(pk(1));
+    auto bob   = table.select_by_key(pk(2));
+    auto carol = table.select_by_key(pk(3));
 
     assert(get_bool(alice->get(3)) == false);  // age 25, updated
     assert(get_bool(bob->get(3))   == false);  // age 30, updated
@@ -457,8 +463,8 @@ void test_auto_increment_continues_after_reopen() {
 
     // should continue from 3, not restart at 1
     Row r = make_user_null_id("Carol", 22, true);
-    uint32_t key = table2.insert(r);
-    assert(key == 3);
+    Key key = table2.insert(r);
+    assert(key == pk(3));
 
     std::cout << "[PASS] auto-increment resumes correctly after reopen\n";
     cleanup();
@@ -484,7 +490,7 @@ void test_insert_and_scan_many_rows() {
     assert(all.size() == N);
 
     for (uint32_t i = 1; i <= N; i++) {
-        auto result = table.select_by_key(i);
+        auto result = table.select_by_key(pk(static_cast<int32_t>(i)));
         assert(result.has_value());
         assert(get_string(result->get(1)) == "user_" + std::to_string(i));
     }
