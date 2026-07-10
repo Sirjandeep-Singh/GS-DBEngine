@@ -20,8 +20,8 @@
 --      parse_create_table() has no table-level PRIMARY KEY clause yet
 --      (only inline single-column PRIMARY KEY as a column constraint)
 
-CREATE DATABASE smoke3;
-USE smoke3;
+CREATE DATABASE smoke4;
+USE smoke4;
 
 -- 1) baseline: single-column INT PK, unchanged behavior
 CREATE TABLE orders (id INT PRIMARY KEY, total INT);

@@ -239,7 +239,10 @@ std::vector<uint8_t> CatalogManager::serialize() const {
     for (auto& [_, schema] : tables_) {
         write_string(buf, schema.name);
         write_uint32(buf, schema.root_page);
-        write_uint32(buf, schema.primary_key_index);
+        write_uint32(buf, static_cast<uint32_t>(schema.primary_key_indices.size()));
+        for (uint32_t pk_idx : schema.primary_key_indices) {
+            write_uint32(buf, pk_idx);
+        }
         write_uint32(buf, static_cast<uint32_t>(schema.columns.size()));
         for (auto& col : schema.columns) {
             write_string(buf, col.name);
@@ -285,7 +288,12 @@ void CatalogManager::deserialize(const std::vector<uint8_t>& data) {
         TableSchema schema;
         schema.name              = read_string(data, pos);
         schema.root_page         = read_uint32(data, pos);
-        schema.primary_key_index = read_uint32(data, pos);
+
+        uint32_t num_pk_cols = read_uint32(data, pos);
+        schema.primary_key_indices.reserve(num_pk_cols);
+        for (uint32_t j = 0; j < num_pk_cols; j++) {
+            schema.primary_key_indices.push_back(read_uint32(data, pos));
+        }
 
         uint32_t num_cols = read_uint32(data, pos);
         for (uint32_t j = 0; j < num_cols; j++) {

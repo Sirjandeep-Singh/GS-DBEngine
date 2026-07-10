@@ -185,6 +185,12 @@ struct CreateTableStmt {
     std::string             table_name;
     std::vector<ColumnDef>  columns;
     std::vector<WhereExprPtr> table_checks;  // table-level CHECK (...) clauses
+    // table-level PRIMARY KEY (col1, col2, ...) clause — column names in
+    // declared order. Empty if no table-level PRIMARY KEY clause was given
+    // (the primary key may still be declared inline on a single ColumnDef
+    // via is_primary_key). Mutually exclusive with an inline PRIMARY KEY —
+    // Executor rejects CREATE TABLE statements that specify both.
+    std::vector<std::string> table_primary_key;
 };
 
 // ─────────────────────────────────────────────

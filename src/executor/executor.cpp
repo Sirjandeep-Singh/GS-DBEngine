@@ -95,25 +95,47 @@ QueryResult Executor::execute_create_table(const CreateTableStmt& stmt)
     TableSchema schema;
     schema.name             = stmt.table_name;
     schema.root_page        = INVALID_PAGE;  // BTree constructor will allocate
-    schema.primary_key_index = UINT32_MAX;
 
     int pk_count = 0;
     for (size_t i = 0; i < stmt.columns.size(); ++i) {
         Column col = column_def_to_column(stmt.columns[i]);  // throws on bad type
         if (col.is_primary_key) {
             pk_count++;
-            schema.primary_key_index = static_cast<uint32_t>(i);
+            schema.primary_key_indices.push_back(static_cast<uint32_t>(i));
         }
         schema.columns.push_back(std::move(col));
+    }
+
+    if (pk_count > 1) {
+        return {false, "CREATE TABLE '" + stmt.table_name +
+                       "': only one inline PRIMARY KEY column is allowed "
+                       "(use a table-level PRIMARY KEY (col1, col2, ...) clause for a composite key)"};
+    }
+
+    // Table-level PRIMARY KEY (a, b, ...) clause — mutually exclusive with
+    // an inline column-level PRIMARY KEY.
+    if (!stmt.table_primary_key.empty()) {
+        if (pk_count > 0) {
+            return {false, "CREATE TABLE '" + stmt.table_name +
+                           "': cannot combine an inline PRIMARY KEY column with a "
+                           "table-level PRIMARY KEY (...) clause"};
+        }
+        for (const std::string& col_name : stmt.table_primary_key) {
+            int idx = schema.column_index(col_name);
+            if (idx < 0) {
+                return {false, "CREATE TABLE '" + stmt.table_name +
+                               "': PRIMARY KEY column '" + col_name + "' does not exist"};
+            }
+            schema.primary_key_indices.push_back(static_cast<uint32_t>(idx));
+            schema.columns[static_cast<size_t>(idx)].is_primary_key = true;
+            schema.columns[static_cast<size_t>(idx)].is_nullable    = false;
+        }
+        pk_count = static_cast<int>(stmt.table_primary_key.size());
     }
 
     if (pk_count == 0) {
         return {false, "CREATE TABLE '" + stmt.table_name +
                        "': no PRIMARY KEY column defined"};
-    }
-    if (pk_count > 1) {
-        return {false, "CREATE TABLE '" + stmt.table_name +
-                       "': only one PRIMARY KEY column is allowed"};
     }
 
     // Compile CHECK expressions (column-level, then table-level) into the
@@ -490,7 +512,7 @@ std::vector<Executor::JoinedRow> Executor::nested_loop_join(
                 combined.values.resize(left_width, std::monostate{});  // NULL left side
                 combined.values.insert(combined.values.end(),
                                        rr.row.values.begin(), rr.row.values.end());
-                out.push_back({std::move(combined), 0});
+                out.push_back({std::move(combined), Key{}});  // no matching left row
             }
         }
     } else {

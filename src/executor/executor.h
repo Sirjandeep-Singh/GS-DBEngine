@@ -233,8 +233,8 @@ private:
     // row.values = left columns first, right columns appended.
     // For LEFT JOIN with no right match, right values are std::monostate (NULL).
     struct JoinedRow {
-        Row      row;
-        uint32_t left_pk;
+        Row row;
+        Key left_pk;
     };
 
     // Nested-loop join of left_results against right_table using the ON clause.

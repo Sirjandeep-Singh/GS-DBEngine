@@ -310,6 +310,13 @@ Statement Parser::parse_create_table() {
             expect(TokenType::LPAREN, "CHECK (...)");
             stmt.table_checks.push_back(parse_or_expr());
             expect(TokenType::RPAREN, "CHECK (...)");
+        } else if (check(TokenType::PRIMARY) && pos_ + 1 < tokens_.size()
+                   && tokens_[pos_ + 1].type == TokenType::KEY) {
+            // table-level constraint: PRIMARY KEY (col1, col2, ...) — this is
+            // the only way to declare a composite (multi-column) primary key;
+            // the inline column-level PRIMARY KEY only ever names one column.
+            advance(); advance();  // consume PRIMARY KEY
+            stmt.table_primary_key = parse_column_list();
         } else {
             stmt.columns.push_back(parse_column_def());
         }

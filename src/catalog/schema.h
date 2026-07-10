@@ -89,7 +89,12 @@ struct TableSchema {
     std::string              name;           // table name
     std::vector<Column>      columns;        // column definitions, in order
     uint32_t                 root_page;      // page_id of the B+ tree root for this table
-    uint32_t                 primary_key_index; // index into columns[] of the primary key column
+    // indices into columns[] that make up the primary key, in declared order.
+    // size() == 1 for the common single-column case (INT or otherwise);
+    // size() > 1 for a table-level composite PRIMARY KEY (a, b, ...).
+    // The BTree Key built from a row is the tuple of values at these
+    // indices, in this order — see Table::extract_primary_key.
+    std::vector<uint32_t>    primary_key_indices;
     std::vector<CheckConstraint> checks;     // CHECK constraints, all implicitly ANDed together
 
     // returns the column index for a given column name, or -1 if not found
@@ -100,8 +105,15 @@ struct TableSchema {
         return -1;
     }
 
+    bool is_composite_primary_key() const {
+        return primary_key_indices.size() > 1;
+    }
+
+    // returns the sole primary key column. Only meaningful when the
+    // primary key is a single column — callers must not call this for a
+    // composite key (is_composite_primary_key() == true).
     const Column& primary_key_column() const {
-        return columns[primary_key_index];
+        return columns[primary_key_indices.at(0)];
     }
 };
 
