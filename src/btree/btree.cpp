@@ -4,6 +4,19 @@
 #include <algorithm>
 #include <cstring>
 
+namespace {
+// stringifies a Key for error messages, e.g. "(1, "abc")" for a composite key
+std::string key_to_string(const Key& key) {
+    std::string s = "(";
+    for (size_t i = 0; i < key.size(); i++) {
+        if (i > 0) s += ", ";
+        s += value_to_string(key[i]);
+    }
+    s += ")";
+    return s;
+}
+}
+
 BTree::BTree(BufferPool& buffer_pool, WALManager& wal, FreeListManager& free_list, uint32_t root_page)
     : buffer_pool_(buffer_pool), wal_(wal), free_list_(free_list), root_page_(root_page)
 {
@@ -43,12 +56,20 @@ uint16_t BTree::min_cells_for(NodeType type) const {
     return 1;
 }
 
-uint32_t BTree::find_leaf_page(uint32_t key) const {
+uint32_t BTree::leaf_entry_size(const Key& key, const std::vector<uint8_t>& value) {
+    return static_cast<uint32_t>(KeyCodec::encode(key).size()) + sizeof(uint32_t) + static_cast<uint32_t>(value.size());
+}
+
+uint32_t BTree::internal_entry_size(const Key& key) {
+    return static_cast<uint32_t>(KeyCodec::encode(key).size()) + sizeof(uint32_t);
+}
+
+uint32_t BTree::find_leaf_page(const Key& key) const {
     std::vector<uint32_t> path;
     return find_leaf_page_with_path(key, path);
 }
 
-uint32_t BTree::find_leaf_page_with_path(uint32_t key, std::vector<uint32_t>& path) const {
+uint32_t BTree::find_leaf_page_with_path(const Key& key, std::vector<uint32_t>& path) const {
     uint32_t current = root_page_;
 
     while (true) {
@@ -68,7 +89,7 @@ uint32_t BTree::find_leaf_page_with_path(uint32_t key, std::vector<uint32_t>& pa
     }
 }
 
-std::optional<std::vector<uint8_t>> BTree::search(uint32_t key) const {
+std::optional<std::vector<uint8_t>> BTree::search(const Key& key) const {
     uint32_t leaf_page_id = find_leaf_page(key);
 
     Page* page = buffer_pool_.fetch_page(leaf_page_id);
@@ -82,7 +103,7 @@ std::optional<std::vector<uint8_t>> BTree::search(uint32_t key) const {
     return std::nullopt;
 }
 
-void BTree::insert(uint32_t key, const std::vector<uint8_t>& value) {
+void BTree::insert(const Key& key, const std::vector<uint8_t>& value) {
     uint32_t transaction_id = wal_.begin();
 
     uint32_t leaf_page_id = find_leaf_page(key);
@@ -93,10 +114,10 @@ void BTree::insert(uint32_t key, const std::vector<uint8_t>& value) {
     std::vector<uint8_t> existing;
     if (node.find_in_leaf(key, existing)) {
         buffer_pool_.unpin_page(leaf_page_id, false);
-        throw std::runtime_error("BTree::insert: duplicate key " + std::to_string(key));
+        throw std::runtime_error("BTree::insert: duplicate key " + key_to_string(key));
     }
 
-    uint32_t entry_size  = sizeof(uint32_t) + sizeof(uint32_t) + static_cast<uint32_t>(value.size());
+    uint32_t entry_size  = leaf_entry_size(key, value);
     uint32_t used_space  = PAGE_SIZE - node.free_space_ptr_value();
     uint32_t available   = PAGE_SIZE - NODE_HEADER_SIZE - used_space;
     bool would_overflow  = entry_size > available;
@@ -113,7 +134,7 @@ void BTree::insert(uint32_t key, const std::vector<uint8_t>& value) {
     wal_.commit(transaction_id);
 }
 
-void BTree::insert_into_leaf(uint32_t transaction_id, uint32_t leaf_page_id, uint32_t key, const std::vector<uint8_t>& value) {
+void BTree::insert_into_leaf(uint32_t transaction_id, uint32_t leaf_page_id, const Key& key, const std::vector<uint8_t>& value) {
     Page* page = buffer_pool_.fetch_page(leaf_page_id);
     BTreeNode node(page);
 
@@ -153,7 +174,7 @@ void BTree::split_leaf(uint32_t transaction_id, uint32_t leaf_page_id) {
     left_node.set_leaf_entries(left_entries);
     left_node.set_next_leaf(right_page_id);
 
-    uint32_t split_key = right_entries.front().key;
+    Key split_key = right_entries.front().key;
 
     buffer_pool_.unpin_page(leaf_page_id, true);
     buffer_pool_.unpin_page(right_page_id, true);
@@ -174,7 +195,7 @@ void BTree::split_internal(uint32_t transaction_id, uint32_t internal_page_id) {
 
     size_t mid = entries.size() / 2;
 
-    uint32_t promoted_key          = entries[mid].key;
+    Key      promoted_key          = entries[mid].key;
     uint32_t promoted_left_child   = entries[mid].child_page_id;
 
     std::vector<InternalEntry> left_entries(entries.begin(), entries.begin() + mid);
@@ -216,7 +237,7 @@ void BTree::split_internal(uint32_t transaction_id, uint32_t internal_page_id) {
     insert_into_parent(transaction_id, internal_page_id, promoted_key, right_page_id);
 }
 
-void BTree::insert_into_parent(uint32_t transaction_id, uint32_t left_page_id, uint32_t split_key, uint32_t right_page_id) {
+void BTree::insert_into_parent(uint32_t transaction_id, uint32_t left_page_id, const Key& split_key, uint32_t right_page_id) {
     Page* left_page = buffer_pool_.fetch_page(left_page_id);
     BTreeNode left_node(left_page);
     uint32_t parent_page_id = left_node.parent_page();
@@ -249,6 +270,32 @@ void BTree::insert_into_parent(uint32_t transaction_id, uint32_t left_page_id, u
         return;
     }
 
+    // With fixed-size (uint32_t) keys, a page holding entries pushed past
+    // is_full()'s 64-byte margin could still absorb one more small entry,
+    // so the old code checked is_full() only AFTER writing and split
+    // reactively. With variable-length keys (VARCHAR / composite) a single
+    // new entry can be far larger than that margin, so we now compute the
+    // exact size up front and split BEFORE writing if it wouldn't fit —
+    // the margin-based is_full() check afterward remains as a secondary,
+    // cheap proactive split for the common case.
+    Page* precheck_page = buffer_pool_.fetch_page(parent_page_id);
+    BTreeNode precheck_node(precheck_page);
+    uint32_t new_entry_size = internal_entry_size(split_key);
+    uint32_t used_space     = PAGE_SIZE - precheck_node.free_space_ptr_value();
+    uint32_t available      = PAGE_SIZE - NODE_HEADER_SIZE - used_space;
+    bool would_overflow     = new_entry_size > available;
+    buffer_pool_.unpin_page(parent_page_id, false);
+
+    if (would_overflow) {
+        split_internal(transaction_id, parent_page_id);
+        // the split changed which page split_key's entry belongs in —
+        // re-resolve the parent the same way find_leaf_page would for a
+        // leaf: walk from left_page_id's (now possibly updated) parent.
+        Page* lp = buffer_pool_.fetch_page(left_page_id);
+        parent_page_id = BTreeNode(lp).parent_page();
+        buffer_pool_.unpin_page(left_page_id, false);
+    }
+
     Page* parent_page = buffer_pool_.fetch_page(parent_page_id);
     BTreeNode parent_node(parent_page);
 
@@ -258,7 +305,7 @@ void BTree::insert_into_parent(uint32_t transaction_id, uint32_t left_page_id, u
         [](const InternalEntry& a, const InternalEntry& b) { return a.key < b.key; });
 
     auto it = std::find_if(entries.begin(), entries.end(),
-        [split_key](const InternalEntry& e) { return e.key == split_key; });
+        [&split_key](const InternalEntry& e) { return e.key == split_key; });
     size_t idx = std::distance(entries.begin(), it);
 
     if (idx + 1 < entries.size()) {
@@ -271,6 +318,11 @@ void BTree::insert_into_parent(uint32_t transaction_id, uint32_t left_page_id, u
     buffer_pool_.unpin_page(parent_page_id, true);
     write_page_through_wal(transaction_id, parent_page_id, parent_page);
 
+    Page* rp2 = buffer_pool_.fetch_page(right_page_id);
+    BTreeNode(rp2).set_parent_page(parent_page_id);
+    buffer_pool_.unpin_page(right_page_id, true);
+    write_page_through_wal(transaction_id, right_page_id, rp2);
+
     Page* check_page = buffer_pool_.fetch_page(parent_page_id);
     bool parent_full = BTreeNode(check_page).is_full();
     buffer_pool_.unpin_page(parent_page_id, false);
@@ -280,8 +332,8 @@ void BTree::insert_into_parent(uint32_t transaction_id, uint32_t left_page_id, u
     }
 }
 
-std::vector<std::pair<uint32_t, std::vector<uint8_t>>> BTree::scan_all() const {
-    std::vector<std::pair<uint32_t, std::vector<uint8_t>>> result;
+std::vector<std::pair<Key, std::vector<uint8_t>>> BTree::scan_all() const {
+    std::vector<std::pair<Key, std::vector<uint8_t>>> result;
 
     uint32_t current = root_page_;
     while (true) {
@@ -313,8 +365,8 @@ std::vector<std::pair<uint32_t, std::vector<uint8_t>>> BTree::scan_all() const {
     return result;
 }
 
-std::vector<std::pair<uint32_t, std::vector<uint8_t>>> BTree::range_scan(uint32_t start, uint32_t end) const {
-    std::vector<std::pair<uint32_t, std::vector<uint8_t>>> result;
+std::vector<std::pair<Key, std::vector<uint8_t>>> BTree::range_scan(const Key& start, const Key& end) const {
+    std::vector<std::pair<Key, std::vector<uint8_t>>> result;
 
     uint32_t current = find_leaf_page(start);
 
@@ -338,7 +390,7 @@ std::vector<std::pair<uint32_t, std::vector<uint8_t>>> BTree::range_scan(uint32_
     return result;
 }
 
-void BTree::remove(uint32_t key) {
+void BTree::remove(const Key& key) {
     uint32_t transaction_id = wal_.begin();
 
     std::vector<uint32_t> path;
@@ -351,7 +403,7 @@ void BTree::remove(uint32_t key) {
     buffer_pool_.unpin_page(leaf_page_id, false);
 
     if (!found) {
-        throw std::runtime_error("BTree::remove: key not found " + std::to_string(key));
+        throw std::runtime_error("BTree::remove: key not found " + key_to_string(key));
     }
 
     remove_from_leaf(transaction_id, leaf_page_id, key);
@@ -369,26 +421,26 @@ void BTree::remove(uint32_t key) {
     wal_.commit(transaction_id);
 }
 
-void BTree::remove_from_leaf(uint32_t transaction_id, uint32_t leaf_page_id, uint32_t key) {
+void BTree::remove_from_leaf(uint32_t transaction_id, uint32_t leaf_page_id, const Key& key) {
     Page* page = buffer_pool_.fetch_page(leaf_page_id);
     BTreeNode node(page);
 
     auto entries = node.get_leaf_entries();
     entries.erase(std::remove_if(entries.begin(), entries.end(),
-        [key](const LeafEntry& e) { return e.key == key; }), entries.end());
+        [&key](const LeafEntry& e) { return e.key == key; }), entries.end());
 
     node.set_leaf_entries(entries);
     buffer_pool_.unpin_page(leaf_page_id, true);
     write_page_through_wal(transaction_id, leaf_page_id, page);
 }
 
-void BTree::remove_from_internal(uint32_t transaction_id, uint32_t internal_page_id, uint32_t key) {
+void BTree::remove_from_internal(uint32_t transaction_id, uint32_t internal_page_id, const Key& key) {
     Page* page = buffer_pool_.fetch_page(internal_page_id);
     BTreeNode node(page);
 
     auto entries = node.get_internal_entries();
     entries.erase(std::remove_if(entries.begin(), entries.end(),
-        [key](const InternalEntry& e) { return e.key == key; }), entries.end());
+        [&key](const InternalEntry& e) { return e.key == key; }), entries.end());
 
     node.set_internal_entries(entries);
     buffer_pool_.unpin_page(internal_page_id, true);
@@ -408,7 +460,7 @@ BTree::SiblingInfo BTree::find_siblings(uint32_t page_id, uint32_t parent_page_i
     for (auto& e : entries) children.push_back(e.child_page_id);
     children.push_back(rightmost);
 
-    std::vector<uint32_t> keys;
+    std::vector<Key> keys;
     for (auto& e : entries) keys.push_back(e.key);
 
     int idx = -1;
@@ -591,7 +643,7 @@ bool BTree::try_redistribute(uint32_t transaction_id, uint32_t page_id, uint32_t
                 Page* pp = buffer_pool_.fetch_page(parent_page_id);
                 BTreeNode parent_node(pp);
                 auto p_entries = parent_node.get_internal_entries();
-                uint32_t new_right_first = right_entries.empty() ? borrowed.key : right_entries.front().key;
+                Key new_right_first = right_entries.empty() ? borrowed.key : right_entries.front().key;
                 for (auto& e : p_entries) {
                     if (e.key == siblings.right_key) { e.key = new_right_first; break; }
                 }
@@ -650,7 +702,7 @@ void BTree::merge_with_sibling(uint32_t transaction_id, uint32_t page_id, uint32
 
     uint32_t merge_into;
     uint32_t merge_from;
-    uint32_t separator_key;
+    Key      separator_key;
     bool current_is_left;
 
     if (siblings.left_sibling != INVALID_PAGE) {
@@ -742,7 +794,7 @@ void BTree::merge_with_sibling(uint32_t transaction_id, uint32_t page_id, uint32
         }
 
         p_entries.erase(std::remove_if(p_entries.begin(), p_entries.end(),
-            [separator_key](const InternalEntry& e) { return e.key == separator_key; }),
+            [&separator_key](const InternalEntry& e) { return e.key == separator_key; }),
             p_entries.end());
         parent_node_fix.set_internal_entries(p_entries);
 

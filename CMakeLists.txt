@@ -20,6 +20,7 @@ add_library(gsdb_lib STATIC
     src/storage/buffer_pool.cpp
     src/wal/wal_manager.cpp
     src/catalog/catalog_manager.cpp
+    src/btree/key.cpp
     src/btree/btree_node.cpp
     src/btree/btree.cpp
     src/btree/free_list_manager.cpp

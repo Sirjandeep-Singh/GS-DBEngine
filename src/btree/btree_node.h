@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 #include "../storage/page.h"
+#include "key.h"
 
 // A B+ tree node is just an interpretation of a Page's raw bytes.
 // Two node types share the same page layout convention:
@@ -13,8 +14,13 @@
 //   [free space]
 //   [cells]                 ← grow upward from the end of the page
 //
-// Internal node cell:  [key (4 bytes)] [child_page_id (4 bytes)]
-// Leaf node cell:       [key (4 bytes)] [value_size (4 bytes)] [value bytes]
+// Keys are variable-length (see key.h / KeyCodec) — a single-column INT
+// or VARCHAR key and a multi-column composite key are both just a Key
+// (vector<Value>) encoded to a self-delimiting byte blob, so no separate
+// "wide key" code path is needed here.
+//
+// Internal node cell:  [key (KeyCodec-encoded, variable)] [child_page_id (4 bytes)]
+// Leaf node cell:       [key (KeyCodec-encoded, variable)] [value_size (4 bytes)] [value bytes]
 
 enum class NodeType : uint8_t {
     INTERNAL = 1,
@@ -38,13 +44,13 @@ static const uint32_t NODE_HEADER_SIZE = sizeof(NodeHeader);
 // key[i] separates child[i] (keys < key[i]) from child[i+1] (keys >= key[i]).
 // child[num_keys] is stored separately as rightmost_child in the header.
 struct InternalEntry {
-    uint32_t key;
+    Key      key;
     uint32_t child_page_id;
 };
 
 // An in-memory, deserialized view of a leaf node's entries.
 struct LeafEntry {
-    uint32_t             key;
+    Key                   key;
     std::vector<uint8_t> value;  // serialized row bytes
 };
 
@@ -79,7 +85,7 @@ public:
     void                   set_leaf_entries(const std::vector<LeafEntry>& entries);
 
     // returns true and fills `out` if key is found in this leaf
-    bool find_in_leaf(uint32_t key, std::vector<uint8_t>& out) const;
+    bool find_in_leaf(const Key& key, std::vector<uint8_t>& out) const;
 
     // ---- Internal node operations ----
     uint32_t rightmost_child() const;
@@ -89,7 +95,7 @@ public:
     void                       set_internal_entries(const std::vector<InternalEntry>& entries);
 
     // given a search key, returns which child page to descend into
-    uint32_t find_child_for_key(uint32_t key) const;
+    uint32_t find_child_for_key(const Key& key) const;
 
     // initializes a blank page as an empty node of the given type
     static void init_node(Page* page, NodeType type);

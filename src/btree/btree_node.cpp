@@ -75,7 +75,12 @@ void BTreeNode::init_node(Page* page, NodeType type) {
 //
 // Layout per leaf entry, written back-to-back starting from the END of the
 // page and growing toward the header (free_space_ptr tracks the boundary):
-//   [key: 4 bytes][value_size: 4 bytes][value bytes]
+//   [key: KeyCodec-encoded, variable][value_size: 4 bytes][value bytes]
+//
+// The key portion is self-delimiting (KeyCodec::decode knows exactly how
+// many bytes it consumed without an outer length prefix), so entries of
+// differing key size — a single INT key next to a multi-column composite
+// key, for instance — sit back-to-back with no padding or wrapper needed.
 //
 // Cell offsets are NOT stored separately — entries are simply concatenated
 // in sorted-by-key order, and we scan linearly to find/insert. This keeps
@@ -91,8 +96,7 @@ std::vector<LeafEntry> BTreeNode::get_leaf_entries() const {
 
     while (ptr < end) {
         LeafEntry entry;
-        std::memcpy(&entry.key, ptr, sizeof(uint32_t));
-        ptr += sizeof(uint32_t);
+        entry.key = KeyCodec::decode(ptr);
 
         uint32_t value_size;
         std::memcpy(&value_size, ptr, sizeof(uint32_t));
@@ -118,14 +122,15 @@ void BTreeNode::set_leaf_entries(const std::vector<LeafEntry>& entries) {
 
     for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
         const LeafEntry& entry = *it;
+        std::vector<uint8_t> key_bytes = KeyCodec::encode(entry.key);
         uint32_t value_size = static_cast<uint32_t>(entry.value.size());
-        size_t   entry_size = sizeof(uint32_t) + sizeof(uint32_t) + value_size;
+        size_t   entry_size = key_bytes.size() + sizeof(uint32_t) + value_size;
 
         write_ptr -= entry_size;
 
         uint8_t* p = write_ptr;
-        std::memcpy(p, &entry.key, sizeof(uint32_t));
-        p += sizeof(uint32_t);
+        std::memcpy(p, key_bytes.data(), key_bytes.size());
+        p += key_bytes.size();
         std::memcpy(p, &value_size, sizeof(uint32_t));
         p += sizeof(uint32_t);
         std::memcpy(p, entry.value.data(), value_size);
@@ -135,7 +140,7 @@ void BTreeNode::set_leaf_entries(const std::vector<LeafEntry>& entries) {
     header()->free_space_ptr  = static_cast<uint16_t>(write_ptr - page_->data);
 }
 
-bool BTreeNode::find_in_leaf(uint32_t key, std::vector<uint8_t>& out) const {
+bool BTreeNode::find_in_leaf(const Key& key, std::vector<uint8_t>& out) const {
     auto entries = get_leaf_entries();
     for (const auto& entry : entries) {
         if (entry.key == key) {
@@ -150,7 +155,7 @@ bool BTreeNode::find_in_leaf(uint32_t key, std::vector<uint8_t>& out) const {
 // Internal node serialization
 //
 // Layout per internal entry, written back-to-back from the end of the page:
-//   [key: 4 bytes][child_page_id: 4 bytes]
+//   [key: KeyCodec-encoded, variable][child_page_id: 4 bytes]
 // rightmost_child is stored in the header, not as a cell.
 // ─────────────────────────────────────────────
 
@@ -161,12 +166,11 @@ std::vector<InternalEntry> BTreeNode::get_internal_entries() const {
 
     while (ptr < end) {
         InternalEntry entry;
-        std::memcpy(&entry.key, ptr, sizeof(uint32_t));
-        ptr += sizeof(uint32_t);
+        entry.key = KeyCodec::decode(ptr);
         std::memcpy(&entry.child_page_id, ptr, sizeof(uint32_t));
         ptr += sizeof(uint32_t);
 
-        entries.push_back(entry);
+        entries.push_back(std::move(entry));
     }
 
     return entries;
@@ -178,11 +182,12 @@ void BTreeNode::set_internal_entries(const std::vector<InternalEntry>& entries) 
 
     for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
         const InternalEntry& entry = *it;
-        write_ptr -= (sizeof(uint32_t) + sizeof(uint32_t));
+        std::vector<uint8_t> key_bytes = KeyCodec::encode(entry.key);
+        write_ptr -= (key_bytes.size() + sizeof(uint32_t));
 
         uint8_t* p = write_ptr;
-        std::memcpy(p, &entry.key, sizeof(uint32_t));
-        p += sizeof(uint32_t);
+        std::memcpy(p, key_bytes.data(), key_bytes.size());
+        p += key_bytes.size();
         std::memcpy(p, &entry.child_page_id, sizeof(uint32_t));
     }
 
@@ -190,10 +195,10 @@ void BTreeNode::set_internal_entries(const std::vector<InternalEntry>& entries) 
     header()->free_space_ptr = static_cast<uint16_t>(write_ptr - page_->data);
 }
 
-uint32_t BTreeNode::find_child_for_key(uint32_t key) const {
+uint32_t BTreeNode::find_child_for_key(const Key& key) const {
     auto entries = get_internal_entries();
 
-    // entries are sorted ascending by key.
+    // entries are sorted ascending by key (lexicographic tuple order).
     // entries[i].key separates "go left" from "go right":
     //   key < entries[0].key          -> entries[0].child_page_id
     //   entries[i-1].key <= key < entries[i].key -> entries[i].child_page_id
@@ -216,14 +221,18 @@ uint16_t BTreeNode::free_space_ptr_value() const {
 
 bool BTreeNode::is_full() const {    // free space remaining = free_space_ptr - end of header
     // if free space is below a safety threshold, consider the page full.
-    // threshold accounts for the worst case next insertion: a max-size
-    // entry should not be allowed to overflow the page.
+    // This is only a cheap heuristic used to decide whether to proactively
+    // split a page right after a write (see BTree::insert_into_parent) —
+    // it is NOT what prevents page overflow. With variable-length keys
+    // (VARCHAR / composite), a single entry can be far larger than this
+    // margin, so every call site that actually writes an entry (leaf
+    // insert, internal insert) computes the exact encoded size first and
+    // splits BEFORE writing if it wouldn't fit — see the precise
+    // available-space checks in btree.cpp. is_full() only decides "is it
+    // worth proactively splitting now", not "is it safe to write".
     uint32_t used_by_header = NODE_HEADER_SIZE;
     uint32_t free_space     = header()->free_space_ptr - used_by_header;
 
-    // conservative threshold — leave room for at least one more reasonably
-    // sized entry before declaring full. Actual overflow is also checked
-    // by the caller before writing.
     const uint32_t SAFETY_MARGIN = 64;
     return free_space < SAFETY_MARGIN;
 }

@@ -2,6 +2,25 @@
 
 #include <stdexcept>
 #include "../row/serializer.h"
+#include "../btree/key.h"
+
+namespace {
+// The BTree layer now stores generic Key (vector<Value>) — a 1-element
+// Key for a scalar column, or an N-element Key for a composite one. Table
+// still only exposes single-column INT primary keys in this pass (that's
+// what extract_primary_key() enforces below); composite/non-int PRIMARY
+// KEY support is wired up at the schema/parser layer in a follow-up. These
+// two helpers are the adapter between Table's existing uint32_t PK API and
+// the BTree's new generic Key API, so nothing above Table needs to change
+// yet.
+Key to_key(uint32_t primary_key) {
+    return Key{ static_cast<int32_t>(primary_key) };
+}
+
+uint32_t from_key(const Key& key) {
+    return static_cast<uint32_t>(get_int(key.at(0)));
+}
+}
 
 Table::Table(const TableSchema& schema, BufferPool& buffer_pool, WALManager& wal, FreeListManager& free_list)
     : schema_(schema), btree_(buffer_pool, wal, free_list, schema.root_page), next_auto_increment_(1)
@@ -22,7 +41,7 @@ void Table::init_auto_increment() {
     // so that after a restart, auto-increment continues from the right value
     auto all = btree_.scan_all();
     if (!all.empty()) {
-        next_auto_increment_ = all.back().first + 1;
+        next_auto_increment_ = from_key(all.back().first) + 1;
     }
 }
 
@@ -56,13 +75,13 @@ uint32_t Table::insert(Row row) {
     uint32_t primary_key = extract_primary_key(row);
 
     // verify key doesn't already exist
-    if (btree_.search(primary_key).has_value()) {
+    if (btree_.search(to_key(primary_key)).has_value()) {
         throw std::runtime_error(
             "Table::insert: duplicate primary key " + std::to_string(primary_key));
     }
 
     auto bytes = RowSerializer::serialize(row, schema_);
-    btree_.insert(primary_key, bytes);
+    btree_.insert(to_key(primary_key), bytes);
 
     // advance auto-increment counter past the inserted key
     if (primary_key >= next_auto_increment_) {
@@ -77,7 +96,7 @@ uint32_t Table::insert(Row row) {
 // ─────────────────────────────────────────────
 
 std::optional<Row> Table::select_by_key(uint32_t primary_key) const {
-    auto bytes = btree_.search(primary_key);
+    auto bytes = btree_.search(to_key(primary_key));
     if (!bytes.has_value()) return std::nullopt;
     return RowSerializer::deserialize(*bytes, schema_);
 }
@@ -89,7 +108,7 @@ std::vector<ScanResult> Table::scan(const Predicate& predicate) const {
     for (auto& [key, bytes] : all) {
         Row row = RowSerializer::deserialize(bytes, schema_);
         if (predicate(row)) {
-            results.push_back({key, std::move(row)});
+            results.push_back({from_key(key), std::move(row)});
         }
     }
 
@@ -103,7 +122,7 @@ std::vector<ScanResult> Table::scan(const Predicate& predicate) const {
 void Table::update(uint32_t primary_key,
                    const std::vector<std::pair<size_t, Value>>& new_values) {
     // verify key exists and fetch the current row
-    auto bytes = btree_.search(primary_key);
+    auto bytes = btree_.search(to_key(primary_key));
     if (!bytes.has_value()) {
         throw std::runtime_error(
             "Table::update: primary key not found " + std::to_string(primary_key));
@@ -125,9 +144,9 @@ void Table::update(uint32_t primary_key,
     }
 
     // delete old blob, reinsert new blob
-    btree_.remove(primary_key);
+    btree_.remove(to_key(primary_key));
     auto new_bytes = RowSerializer::serialize(row, schema_);
-    btree_.insert(primary_key, new_bytes);
+    btree_.insert(to_key(primary_key), new_bytes);
 }
 
 // ─────────────────────────────────────────────
@@ -135,11 +154,11 @@ void Table::update(uint32_t primary_key,
 // ─────────────────────────────────────────────
 
 void Table::delete_row(uint32_t primary_key) {
-    if (!btree_.search(primary_key).has_value()) {
+    if (!btree_.search(to_key(primary_key)).has_value()) {
         throw std::runtime_error(
             "Table::delete_row: primary key not found " + std::to_string(primary_key));
     }
-    btree_.remove(primary_key);
+    btree_.remove(to_key(primary_key));
 }
 
 // ─────────────────────────────────────────────
@@ -154,13 +173,13 @@ uint32_t Table::delete_where(const Predicate& predicate) {
     for (auto& [key, bytes] : all) {
         Row row = RowSerializer::deserialize(bytes, schema_);
         if (predicate(row)) {
-            to_delete.push_back(key);
+            to_delete.push_back(from_key(key));
         }
     }
 
     // phase 2: delete after scan is complete
     for (uint32_t key : to_delete) {
-        btree_.remove(key);
+        btree_.remove(to_key(key));
     }
 
     return static_cast<uint32_t>(to_delete.size());
@@ -183,15 +202,15 @@ uint32_t Table::update_where(const Predicate& predicate,
                 }
                 row.get(col_idx) = new_val;
             }
-            to_update.emplace_back(key, std::move(row));
+            to_update.emplace_back(from_key(key), std::move(row));
         }
     }
 
     // phase 2: delete + reinsert after scan is complete
     for (auto& [key, new_row] : to_update) {
-        btree_.remove(key);
+        btree_.remove(to_key(key));
         auto new_bytes = RowSerializer::serialize(new_row, schema_);
-        btree_.insert(key, new_bytes);
+        btree_.insert(to_key(key), new_bytes);
     }
 
     return static_cast<uint32_t>(to_update.size());

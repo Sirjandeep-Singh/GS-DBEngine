@@ -1,5 +1,5 @@
 //# BTree + FreeListManager tests (same layer — tested together)
-//g++ -std=c++17 tests/test_btree.cpp src/storage/disk_manager.cpp src/storage/buffer_pool.cpp src/wal/wal_manager.cpp src/header/header_manager.cpp src/btree/free_list_manager.cpp src/btree/btree_node.cpp src/btree/btree.cpp -o tests/test_btree && ./tests/test_btree
+//g++ -std=c++17 tests/test_btree.cpp src/storage/disk_manager.cpp src/storage/buffer_pool.cpp src/wal/wal_manager.cpp src/header/header_manager.cpp src/btree/free_list_manager.cpp src/btree/key.cpp src/btree/btree_node.cpp src/btree/btree.cpp -o tests/test_btree && ./tests/test_btree
 #include <iostream>
 #include <cassert>
 #include <cstring>
@@ -29,6 +29,18 @@ std::vector<uint8_t> make_value(uint32_t n) {
     return std::vector<uint8_t>(s.begin(), s.end());
 }
 
+// BTree keys are now Key (vector<Value>) rather than a bare uint32_t —
+// these two helpers keep the existing uint32_t-based test bodies below
+// mostly unchanged, converting at the BTree call boundary. K() builds a
+// scalar 1-element INT key; KV() extracts it back out.
+Key K(uint32_t n) {
+    return Key{ Value(static_cast<int32_t>(n)) };
+}
+
+uint32_t KV(const Key& key) {
+    return static_cast<uint32_t>(get_int(key.at(0)));
+}
+
 // NOTE ON SETUP CHANGE: every test below now bootstraps a full
 // DiskManager -> BufferPool -> WALManager -> HeaderManager ->
 // FreeListManager chain before constructing a BTree, instead of the old
@@ -53,9 +65,9 @@ void test_insert_and_search_single_key() {
     FreeListManager free_list(bp, wal, hm);
 
     BTree tree(bp, wal, free_list, INVALID_PAGE);
-    tree.insert(1, make_value(1));
+    tree.insert(K(1), make_value(1));
 
-    auto result = tree.search(1);
+    auto result = tree.search(K(1));
     assert(result.has_value());
     assert(result.value() == make_value(1));
 
@@ -73,9 +85,9 @@ void test_search_missing_key_returns_nullopt() {
     FreeListManager free_list(bp, wal, hm);
 
     BTree tree(bp, wal, free_list, INVALID_PAGE);
-    tree.insert(1, make_value(1));
+    tree.insert(K(1), make_value(1));
 
-    auto result = tree.search(999);
+    auto result = tree.search(K(999));
     assert(!result.has_value());
 
     std::cout << "[PASS] search returns nullopt for missing key\n";
@@ -92,11 +104,11 @@ void test_insert_duplicate_key_throws() {
     FreeListManager free_list(bp, wal, hm);
 
     BTree tree(bp, wal, free_list, INVALID_PAGE);
-    tree.insert(5, make_value(5));
+    tree.insert(K(5), make_value(5));
 
     bool threw = false;
     try {
-        tree.insert(5, make_value(999));
+        tree.insert(K(5), make_value(999));
     } catch (const std::runtime_error&) {
         threw = true;
     }
@@ -119,11 +131,11 @@ void test_insert_many_keys_and_search_each() {
 
     const uint32_t N = 1000;
     for (uint32_t i = 0; i < N; i++) {
-        tree.insert(i, make_value(i));
+        tree.insert(K(i), make_value(i));
     }
 
     for (uint32_t i = 0; i < N; i++) {
-        auto result = tree.search(i);
+        auto result = tree.search(K(i));
         assert(result.has_value());
         assert(result.value() == make_value(i));
     }
@@ -145,16 +157,229 @@ void test_insert_out_of_order_keys() {
 
     std::vector<uint32_t> keys = {500, 10, 999, 1, 250, 750, 0, 333};
     for (uint32_t k : keys) {
-        tree.insert(k, make_value(k));
+        tree.insert(K(k), make_value(k));
     }
 
     for (uint32_t k : keys) {
-        auto result = tree.search(k);
+        auto result = tree.search(K(k));
         assert(result.has_value());
         assert(result.value() == make_value(k));
     }
 
     std::cout << "[PASS] insert out-of-order keys, all searchable correctly\n";
+    cleanup();
+}
+
+// ─────────────────────────────────────────────
+// Composite keys / non-int keys
+// ─────────────────────────────────────────────
+
+void test_insert_and_search_varchar_keys() {
+    cleanup();
+    DiskManager dm(DB_FILE);
+    BufferPool  bp(dm);
+    WALManager  wal(WAL_FILE, bp);
+    HeaderManager hm(bp, wal);
+    hm.init();
+    FreeListManager free_list(bp, wal, hm);
+
+    BTree tree(bp, wal, free_list, INVALID_PAGE);
+
+    std::vector<std::string> names = {"banana", "apple", "cherry", "date", "fig"};
+    for (auto& name : names) {
+        Key key = { Value(name) };
+        tree.insert(key, std::vector<uint8_t>(name.begin(), name.end()));
+    }
+
+    for (auto& name : names) {
+        Key key = { Value(name) };
+        auto result = tree.search(key);
+        assert(result.has_value());
+        assert((*result == std::vector<uint8_t>(name.begin(), name.end())));
+    }
+
+    // scan_all must come back in lexicographic (dictionary) string order,
+    // not insertion order
+    auto all = tree.scan_all();
+    assert(all.size() == names.size());
+    std::vector<std::string> sorted_names = names;
+    std::sort(sorted_names.begin(), sorted_names.end());
+    for (size_t i = 0; i < all.size(); i++) {
+        assert(all[i].first == Key{ Value(sorted_names[i]) });
+    }
+
+    std::cout << "[PASS] VARCHAR keys insert/search correctly and sort lexicographically\n";
+    cleanup();
+}
+
+void test_insert_and_search_composite_keys() {
+    cleanup();
+    DiskManager dm(DB_FILE);
+    BufferPool  bp(dm);
+    WALManager  wal(WAL_FILE, bp);
+    HeaderManager hm(bp, wal);
+    hm.init();
+    FreeListManager free_list(bp, wal, hm);
+
+    BTree tree(bp, wal, free_list, INVALID_PAGE);
+
+    // composite (order_id, product_id) keys, inserted out of sorted order
+    std::vector<std::pair<int32_t, int32_t>> pairs = {
+        {2, 3}, {1, 15}, {1, 5}, {2, 1}, {1, 20}, {3, 1}
+    };
+    for (auto& [a, b] : pairs) {
+        Key key = { Value(a), Value(b) };
+        tree.insert(key, make_value(static_cast<uint32_t>(a) * 1000 + static_cast<uint32_t>(b)));
+    }
+
+    for (auto& [a, b] : pairs) {
+        Key key = { Value(a), Value(b) };
+        auto result = tree.search(key);
+        assert(result.has_value());
+        assert(result.value() == make_value(static_cast<uint32_t>(a) * 1000 + static_cast<uint32_t>(b)));
+    }
+
+    // a key that shares the first column with existing entries but not the
+    // second must be treated as distinct — no accidental collision
+    Key not_present = { Value(int32_t(1)), Value(int32_t(6)) };
+    assert(!tree.search(not_present).has_value());
+
+    // scan_all must be in lexicographic tuple order: (1,5) < (1,15) < (1,20)
+    // < (2,1) < (2,3) < (3,1) — first column dominates, second breaks ties
+    auto all = tree.scan_all();
+    assert(all.size() == pairs.size());
+    std::vector<Key> expected_order = {
+        {Value(int32_t(1)), Value(int32_t(5))},
+        {Value(int32_t(1)), Value(int32_t(15))},
+        {Value(int32_t(1)), Value(int32_t(20))},
+        {Value(int32_t(2)), Value(int32_t(1))},
+        {Value(int32_t(2)), Value(int32_t(3))},
+        {Value(int32_t(3)), Value(int32_t(1))},
+    };
+    for (size_t i = 0; i < all.size(); i++) {
+        assert(all[i].first == expected_order[i]);
+    }
+
+    std::cout << "[PASS] composite keys insert/search correctly and sort lexicographically\n";
+    cleanup();
+}
+
+void test_composite_key_duplicate_throws() {
+    cleanup();
+    DiskManager dm(DB_FILE);
+    BufferPool  bp(dm);
+    WALManager  wal(WAL_FILE, bp);
+    HeaderManager hm(bp, wal);
+    hm.init();
+    FreeListManager free_list(bp, wal, hm);
+
+    BTree tree(bp, wal, free_list, INVALID_PAGE);
+
+    Key key = { Value(int32_t(1)), Value(int32_t(1)) };
+    tree.insert(key, make_value(1));
+
+    bool threw = false;
+    try {
+        tree.insert(key, make_value(2));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    assert(threw);
+
+    std::cout << "[PASS] duplicate composite key throws\n";
+    cleanup();
+}
+
+void test_composite_keys_survive_splits_and_removal() {
+    cleanup();
+    DiskManager dm(DB_FILE);
+    BufferPool  bp(dm);
+    WALManager  wal(WAL_FILE, bp);
+    HeaderManager hm(bp, wal);
+    hm.init();
+    FreeListManager free_list(bp, wal, hm);
+
+    BTree tree(bp, wal, free_list, INVALID_PAGE);
+
+    // enough composite keys, with large-ish values, to force real splits
+    // and later merges — not just a single leaf
+    std::vector<std::vector<uint8_t>> values;
+    const int32_t ORDERS = 20;
+    const int32_t ITEMS_PER_ORDER = 10;
+    std::vector<uint8_t> big_value(60, 0x77);
+
+    for (int32_t order = 0; order < ORDERS; order++) {
+        for (int32_t item = 0; item < ITEMS_PER_ORDER; item++) {
+            Key key = { Value(order), Value(item) };
+            tree.insert(key, big_value);
+        }
+    }
+
+    for (int32_t order = 0; order < ORDERS; order++) {
+        for (int32_t item = 0; item < ITEMS_PER_ORDER; item++) {
+            Key key = { Value(order), Value(item) };
+            auto result = tree.search(key);
+            assert(result.has_value());
+            assert(result.value() == big_value);
+        }
+    }
+
+    // remove every other item within each order, verify the rest survive —
+    // exercises underflow/redistribution/merge with composite keys
+    for (int32_t order = 0; order < ORDERS; order++) {
+        for (int32_t item = 0; item < ITEMS_PER_ORDER; item += 2) {
+            Key key = { Value(order), Value(item) };
+            tree.remove(key);
+        }
+    }
+
+    for (int32_t order = 0; order < ORDERS; order++) {
+        for (int32_t item = 0; item < ITEMS_PER_ORDER; item++) {
+            Key key = { Value(order), Value(item) };
+            auto result = tree.search(key);
+            if (item % 2 == 0) {
+                assert(!result.has_value());
+            } else {
+                assert(result.has_value());
+                assert(result.value() == big_value);
+            }
+        }
+    }
+
+    std::cout << "[PASS] composite keys remain correct across splits, merges, and removal\n";
+    cleanup();
+}
+
+void test_range_scan_with_composite_keys_scoped_to_first_column() {
+    cleanup();
+    DiskManager dm(DB_FILE);
+    BufferPool  bp(dm);
+    WALManager  wal(WAL_FILE, bp);
+    HeaderManager hm(bp, wal);
+    hm.init();
+    FreeListManager free_list(bp, wal, hm);
+
+    BTree tree(bp, wal, free_list, INVALID_PAGE);
+
+    // three orders, five items each — range_scan bounded to order 2 only,
+    // using (2, INT_MIN)-ish and (2, INT_MAX)-ish bounds via explicit item bounds
+    for (int32_t order = 1; order <= 3; order++) {
+        for (int32_t item = 0; item < 5; item++) {
+            Key key = { Value(order), Value(item) };
+            tree.insert(key, make_value(static_cast<uint32_t>(order * 10 + item)));
+        }
+    }
+
+    Key start = { Value(int32_t(2)), Value(int32_t(0)) };
+    Key end   = { Value(int32_t(2)), Value(int32_t(4)) };
+    auto result = tree.range_scan(start, end);
+
+    assert(result.size() == 5);
+    for (auto& [key, value] : result) {
+        assert(get_int(key[0]) == 2);
+    }
+
+    std::cout << "[PASS] range_scan correctly scopes to a composite key range within one first-column group\n";
     cleanup();
 }
 
@@ -178,11 +403,11 @@ void test_insert_forces_leaf_split_and_tree_still_correct() {
     std::vector<uint8_t> big_value(100, 0xAB);
 
     for (uint32_t i = 0; i < N; i++) {
-        tree.insert(i, big_value);
+        tree.insert(K(i), big_value);
     }
 
     for (uint32_t i = 0; i < N; i++) {
-        auto result = tree.search(i);
+        auto result = tree.search(K(i));
         assert(result.has_value());
         assert(result.value() == big_value);
     }
@@ -205,7 +430,7 @@ void test_root_page_changes_after_split() {
 
     std::vector<uint8_t> big_value(200, 0xCD);
     for (uint32_t i = 0; i < 100; i++) {
-        tree.insert(i, big_value);
+        tree.insert(K(i), big_value);
     }
 
     // after enough splits, root should have changed from the original leaf
@@ -232,7 +457,7 @@ void test_scan_all_returns_sorted_order() {
 
     std::vector<uint32_t> keys = {50, 10, 90, 30, 70, 20, 80, 40, 60, 0};
     for (uint32_t k : keys) {
-        tree.insert(k, make_value(k));
+        tree.insert(K(k), make_value(k));
     }
 
     auto all = tree.scan_all();
@@ -258,16 +483,16 @@ void test_range_scan_returns_correct_subset() {
     BTree tree(bp, wal, free_list, INVALID_PAGE);
 
     for (uint32_t i = 0; i < 100; i++) {
-        tree.insert(i, make_value(i));
+        tree.insert(K(i), make_value(i));
     }
 
-    auto result = tree.range_scan(20, 30);
+    auto result = tree.range_scan(K(20), K(30));
     assert(result.size() == 11);  // 20 through 30 inclusive
-    assert(result.front().first == 20);
-    assert(result.back().first  == 30);
+    assert(result.front().first == K(20));
+    assert(result.back().first  == K(30));
 
     for (auto& [key, value] : result) {
-        assert(value == make_value(key));
+        assert(value == make_value(KV(key)));
     }
 
     std::cout << "[PASS] range_scan returns correct subset of keys\n";
@@ -287,17 +512,17 @@ void test_range_scan_across_leaf_boundaries() {
 
     std::vector<uint8_t> big_value(100, 0xEF);
     for (uint32_t i = 0; i < 500; i++) {
-        tree.insert(i, big_value);
+        tree.insert(K(i), big_value);
     }
 
     // range that almost certainly spans multiple leaf pages
-    auto result = tree.range_scan(100, 400);
+    auto result = tree.range_scan(K(100), K(400));
     assert(result.size() == 301);
-    assert(result.front().first == 100);
-    assert(result.back().first  == 400);
+    assert(result.front().first == K(100));
+    assert(result.back().first  == K(400));
 
     for (size_t i = 1; i < result.size(); i++) {
-        assert(result[i].first == result[i-1].first + 1);  // contiguous
+        assert(KV(result[i].first) == KV(result[i-1].first) + 1);  // contiguous
     }
 
     std::cout << "[PASS] range_scan works correctly across leaf page boundaries\n";
@@ -318,13 +543,13 @@ void test_remove_single_key() {
     FreeListManager free_list(bp, wal, hm);
 
     BTree tree(bp, wal, free_list, INVALID_PAGE);
-    tree.insert(1, make_value(1));
+    tree.insert(K(1), make_value(1));
 
-    assert(tree.search(1).has_value());
+    assert(tree.search(K(1)).has_value());
 
-    tree.remove(1);
+    tree.remove(K(1));
 
-    assert(!tree.search(1).has_value());
+    assert(!tree.search(K(1)).has_value());
 
     std::cout << "[PASS] remove deletes a single key correctly\n";
     cleanup();
@@ -340,11 +565,11 @@ void test_remove_nonexistent_key_throws() {
     FreeListManager free_list(bp, wal, hm);
 
     BTree tree(bp, wal, free_list, INVALID_PAGE);
-    tree.insert(1, make_value(1));
+    tree.insert(K(1), make_value(1));
 
     bool threw = false;
     try {
-        tree.remove(999);
+        tree.remove(K(999));
     } catch (const std::runtime_error&) {
         threw = true;
     }
@@ -365,21 +590,21 @@ void test_remove_from_multiple_keys() {
 
     BTree tree(bp, wal, free_list, INVALID_PAGE);
     for (uint32_t i = 0; i < 20; i++) {
-        tree.insert(i, make_value(i));
+        tree.insert(K(i), make_value(i));
     }
 
-    tree.remove(5);
-    tree.remove(10);
-    tree.remove(15);
+    tree.remove(K(5));
+    tree.remove(K(10));
+    tree.remove(K(15));
 
-    assert(!tree.search(5).has_value());
-    assert(!tree.search(10).has_value());
-    assert(!tree.search(15).has_value());
+    assert(!tree.search(K(5)).has_value());
+    assert(!tree.search(K(10)).has_value());
+    assert(!tree.search(K(15)).has_value());
 
     // remaining keys still present
     for (uint32_t i = 0; i < 20; i++) {
         if (i == 5 || i == 10 || i == 15) continue;
-        assert(tree.search(i).has_value());
+        assert(tree.search(K(i)).has_value());
     }
 
     std::cout << "[PASS] remove correctly deletes selected keys, leaves others intact\n";
@@ -406,18 +631,18 @@ void test_remove_causes_merge_tree_stays_correct() {
     std::vector<uint8_t> big_value(150, 0x11);
     const uint32_t N = 300;
     for (uint32_t i = 0; i < N; i++) {
-        tree.insert(i, big_value);
+        tree.insert(K(i), big_value);
     }
 
     // delete most of the keys — should trigger redistribution and merging
     // across many nodes as pages empty out
     for (uint32_t i = 0; i < N; i += 2) {
-        tree.remove(i);
+        tree.remove(K(i));
     }
 
     // verify remaining keys are still findable
     for (uint32_t i = 0; i < N; i++) {
-        auto result = tree.search(i);
+        auto result = tree.search(K(i));
         if (i % 2 == 0) {
             assert(!result.has_value());  // deleted
         } else {
@@ -444,15 +669,15 @@ void test_remove_all_keys_empties_tree() {
     const uint32_t N = 200;
     std::vector<uint8_t> value(80, 0x99);
     for (uint32_t i = 0; i < N; i++) {
-        tree.insert(i, value);
+        tree.insert(K(i), value);
     }
 
     for (uint32_t i = 0; i < N; i++) {
-        tree.remove(i);
+        tree.remove(K(i));
     }
 
     for (uint32_t i = 0; i < N; i++) {
-        assert(!tree.search(i).has_value());
+        assert(!tree.search(K(i)).has_value());
     }
 
     auto all = tree.scan_all();
@@ -474,25 +699,25 @@ void test_remove_then_reinsert_works_correctly() {
     BTree tree(bp, wal, free_list, INVALID_PAGE);
 
     for (uint32_t i = 0; i < 50; i++) {
-        tree.insert(i, make_value(i));
+        tree.insert(K(i), make_value(i));
     }
 
     for (uint32_t i = 0; i < 25; i++) {
-        tree.remove(i);
+        tree.remove(K(i));
     }
 
     // reinsert some of the deleted keys with new values
     for (uint32_t i = 0; i < 25; i++) {
-        tree.insert(i, make_value(i + 1000));
+        tree.insert(K(i), make_value(i + 1000));
     }
 
     for (uint32_t i = 0; i < 25; i++) {
-        auto result = tree.search(i);
+        auto result = tree.search(K(i));
         assert(result.has_value());
         assert(result.value() == make_value(i + 1000));
     }
     for (uint32_t i = 25; i < 50; i++) {
-        auto result = tree.search(i);
+        auto result = tree.search(K(i));
         assert(result.has_value());
         assert(result.value() == make_value(i));
     }
@@ -518,7 +743,7 @@ void test_tree_persists_across_reopen() {
 
         BTree tree(bp, wal, free_list, INVALID_PAGE);
         for (uint32_t i = 0; i < 100; i++) {
-            tree.insert(i, make_value(i));
+            tree.insert(K(i), make_value(i));
         }
         root = tree.root_page();
     }
@@ -534,7 +759,7 @@ void test_tree_persists_across_reopen() {
     BTree tree2(bp2, wal2, free_list2, root);
 
     for (uint32_t i = 0; i < 100; i++) {
-        auto result = tree2.search(i);
+        auto result = tree2.search(K(i));
         assert(result.has_value());
         assert(result.value() == make_value(i));
     }
@@ -712,14 +937,14 @@ void test_btree_reuses_freed_pages_after_merge() {
 
     // Phase 1: insert enough to force several splits.
     for (uint32_t i = 0; i < N; i++) {
-        tree.insert(i, big_value);
+        tree.insert(K(i), big_value);
     }
     uint32_t pages_after_inserts = dm.total_pages();
 
     // Phase 2: remove everything — should trigger cascading merges,
     // freeing pages back to the free list rather than leaking them.
     for (uint32_t i = 0; i < N; i++) {
-        tree.remove(i);
+        tree.remove(K(i));
     }
     uint32_t pages_after_removal = dm.total_pages();
 
@@ -732,7 +957,7 @@ void test_btree_reuses_freed_pages_after_merge() {
     // the file back up by another full N-worth of pages — it should
     // reuse what's already sitting on the free list from phase 2.
     for (uint32_t i = 0; i < N; i++) {
-        tree.insert(i, big_value);
+        tree.insert(K(i), big_value);
     }
     uint32_t pages_after_reinsert = dm.total_pages();
 
@@ -740,7 +965,7 @@ void test_btree_reuses_freed_pages_after_merge() {
 
     // and correctness still holds after all that churn
     for (uint32_t i = 0; i < N; i++) {
-        auto result = tree.search(i);
+        auto result = tree.search(K(i));
         assert(result.has_value());
         assert(result.value() == big_value);
     }
@@ -756,6 +981,13 @@ int main() {
     test_insert_duplicate_key_throws();
     test_insert_many_keys_and_search_each();
     test_insert_out_of_order_keys();
+
+    std::cout << "\n=== BTree Composite / Non-Int Key Tests ===\n";
+    test_insert_and_search_varchar_keys();
+    test_insert_and_search_composite_keys();
+    test_composite_key_duplicate_throws();
+    test_composite_keys_survive_splits_and_removal();
+    test_range_scan_with_composite_keys_scoped_to_first_column();
 
     std::cout << "\n=== BTree Splitting Tests ===\n";
     test_insert_forces_leaf_split_and_tree_still_correct();
