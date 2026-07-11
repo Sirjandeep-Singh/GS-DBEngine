@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <optional>
+#include <memory>
 
 #include "../parser/ast.h"
 #include "../catalog/catalog_manager.h"
@@ -14,6 +15,7 @@
 #include "../wal/wal_manager.h"
 #include "../btree/free_list_manager.h"
 #include "../table/table.h"
+#include "../index/index.h"
 #include "../row/row.h"
 
 // Returned by every Executor::execute() call.
@@ -54,6 +56,90 @@ private:
     WALManager&       wal_;
     FreeListManager&  free_list_;
 
+    // ── Index loading ────────────────────────────────────────────────────────
+    //
+    // Constructs one Index per secondary index CatalogManager has on-record
+    // for `schema.name`, so a Table opened for writing can be handed them
+    // via its `indexes` constructor parameter and keep them in sync through
+    // write_row_and_indexes/remove_row_and_indexes. Called at the top of
+    // every statement handler that opens a Table with intent to mutate it
+    // (INSERT/UPDATE/DELETE) — without this, Table defaults to indexes={}
+    // and every secondary index silently goes stale.
+    //
+    // Returned by value (owning) because Index holds a const IndexSchema&
+    // into CatalogManager's own storage (stable — see CatalogManager::get_index)
+    // but Index itself has no home to live in otherwise; the caller keeps
+    // this vector alive for exactly as long as the Table that borrows raw
+    // pointers from it, same lifetime relationship schema already has
+    // between CatalogManager and Table.
+    std::vector<std::unique_ptr<Index>> open_indexes(const TableSchema& schema) const;
+
+    // Returns the raw non-owning pointers open_indexes' unique_ptrs manage —
+    // exactly the shape Table's constructor wants. Kept as a separate step
+    // (rather than folded into open_indexes) so the owning vector and the
+    // pointer vector are visibly two different lifetimes at the call site.
+    static std::vector<Index*> index_ptrs(const std::vector<std::unique_ptr<Index>>& owned);
+
+    // Persists every index root page that may have changed after a
+    // mutating Table call (insert/update_where/delete_where), mirroring
+    // how table root pages are already persisted via
+    // CatalogManager::update_table_root. Call once after the mutation,
+    // passing the same Table the indexes were opened for.
+    void persist_index_roots(const Table& tbl) const;
+
+    // ── Index-assisted scans ─────────────────────────────────────────────────
+    //
+    // Speeds up WHERE evaluation by using a secondary index instead of a full
+    // Table::scan() whenever the WHERE clause has a usable equality match (or,
+    // for a composite index, a leftmost-prefix of equality matches) on an
+    // indexed column. Falls back to Table::scan() whenever no index fits.
+    // The index is only ever used to narrow *candidate* rows: every key it
+    // returns is looked up via Table::select_by_key() and the resulting row
+    // is still re-checked against the full WHERE predicate before being kept
+    // — so a wrong or partial index match can only make this path slower
+    // than it needs to be, never wrong.
+
+    // Walks a WHERE tree and collects every top-level AND-conjoined equality
+    // comparison (column = literal) it can find, as (column_name, value)
+    // pairs. Descends through LOGICAL AND nodes only — an OR or NOT node
+    // contributes nothing from its subtree, since neither side of an OR is a
+    // condition every matching row must satisfy, and NOT's semantics aren't a
+    // simple equality either. This makes the collected list always a set of
+    // *necessary* (if not sufficient) conditions on any matching row, which
+    // is exactly what's safe to use as an index seed.
+    void collect_and_equalities(const WhereExprPtr& expr,
+                                 const TableSchema&  schema,
+                                 const std::string&  alias,
+                                 std::vector<std::pair<std::string, Value>>& out) const;
+
+    // Picks the best usable index for `where` against `schema`, if any: the
+    // one whose column_names has the longest leftmost prefix fully covered by
+    // collect_and_equalities()'s output (each value coerced to the matching
+    // column's type — e.g. an int literal against a FLOAT column — so a
+    // usable index isn't missed purely over a literal's parsed type; ties
+    // broken by catalog order). Returns {index schema, prefix key} on a
+    // match (prefix key in the index's own column order, ready for
+    // Index::find()), or nullopt if no index has even a 1-column prefix
+    // match — the caller falls back to Table::scan().
+    std::optional<std::pair<const IndexSchema*, Key>> find_index_prefix(
+        const WhereExprPtr& where,
+        const TableSchema&  schema,
+        const std::string&  alias = "") const;
+
+    // Returns the rows matching `pred`, using find_index_prefix()'s pick (if
+    // any) to fetch only candidate primary keys via Index::find() +
+    // Table::select_by_key(), instead of a full Table::scan(). `where` is the
+    // same WHERE tree `pred` was built from (see build_predicate) — passed
+    // separately because Predicate is an opaque std::function and
+    // find_index_prefix needs the AST shape; `pred` remains the single source
+    // of truth for which rows actually match, since the index only narrows
+    // candidates and every fetched row is still run through it.
+    std::vector<ScanResult> scan_with_index(const Table&         tbl,
+                                             const TableSchema&  schema,
+                                             const WhereExprPtr& where,
+                                             const Predicate&    pred,
+                                             const std::string&  alias = "") const;
+
     // ── Statement handlers ───────────────────────────────────────────────────
 
     QueryResult execute_select(const SelectStmt& stmt);
@@ -69,6 +155,7 @@ private:
     QueryResult execute_delete(const DeleteStmt& stmt);
     QueryResult execute_create_table(const CreateTableStmt& stmt);
     QueryResult execute_drop_table(const DropTableStmt& stmt);
+    QueryResult execute_create_index(const CreateIndexStmt& stmt);
     QueryResult execute_show(const ShowStmt& stmt);
 
     // These are handled by the Database class — return an error if reached.

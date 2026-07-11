@@ -119,9 +119,20 @@ struct TableSchema {
 
 // describes a secondary index on a table
 struct IndexSchema {
-    std::string name;           // index name
-    std::string table_name;     // which table this index belongs to
-    std::string column_name;    // which column is indexed
+    std::string name;                      // index name
+    std::string table_name;                // which table this index belongs to
+    // names of the indexed column(s), in declared order. size() == 1 for
+    // the common single-column case; size() > 1 for a composite index
+    // (e.g. CREATE INDEX ... ON t (a, b)) — the same "arity via vector"
+    // pattern TableSchema::primary_key_indices already uses for composite
+    // primary keys. The Index class builds its raw BTree key by looking
+    // up each of these columns' values, in this order, then appending the
+    // table's full primary key after them.
+    std::vector<std::string> column_names;
     uint32_t    root_page;      // page_id of the B+ tree root for this index
     bool        is_unique;      // does this index enforce uniqueness?
+
+    bool is_composite() const {
+        return column_names.size() > 1;
+    }
 };

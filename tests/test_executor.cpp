@@ -522,6 +522,310 @@ void test_left_join_preserves_unmatched() {
 }
 
 // ─────────────────────────────────────────────
+// CREATE INDEX Tests
+// ─────────────────────────────────────────────
+//
+// Covers CREATE INDEX statement handling (recognition, backfill, error
+// cases) and confirms Executor's open_indexes()/persist_index_roots()
+// wiring keeps a live index in sync across INSERT/UPDATE/DELETE driven
+// through real SQL — not just the raw Table+Index API already covered
+// directly in test_table_indexes.cpp.
+
+void test_create_index_backfills_existing_rows() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50), country VARCHAR(20));");
+    exec(env, "INSERT INTO users VALUES (1, 'Amrit', 'IN');");
+    exec(env, "INSERT INTO users VALUES (2, 'Priya', 'IN');");
+    exec(env, "INSERT INTO users VALUES (3, 'Sam', 'US');");
+    exec(env, "INSERT INTO users VALUES (4, 'NoCountry', NULL);");  // NULL indexed value — must be skipped
+
+    auto r = exec(env, "CREATE INDEX idx_country ON users (country);");
+    assert(r.success);
+
+    const TableSchema& tschema = env.cat.get_table("users");
+    Index idx(env.cat.get_index("idx_country"), tschema.primary_key_indices.size(), env.bp, env.wal, env.fl);
+    assert(idx.find(Key{Value(std::string("IN"))}).size() == 2);
+    assert(idx.find(Key{Value(std::string("US"))}).size() == 1);
+
+    std::cout << "[PASS] CREATE INDEX backfills entries for pre-existing rows\n";
+    cleanup();
+}
+
+void test_create_index_duplicate_name_rejected() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE users (id INT PRIMARY KEY, country VARCHAR(20));");
+    exec(env, "CREATE INDEX idx_country ON users (country);");
+
+    auto r = exec(env, "CREATE INDEX idx_country ON users (id);");
+    assert(!r.success);
+
+    std::cout << "[PASS] CREATE INDEX with a name already in use is rejected\n";
+    cleanup();
+}
+
+void test_create_index_unknown_column_rejected() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE users (id INT PRIMARY KEY, country VARCHAR(20));");
+
+    auto r = exec(env, "CREATE INDEX idx_bad ON users (does_not_exist);");
+    assert(!r.success);
+
+    std::cout << "[PASS] CREATE INDEX on an unknown column is rejected\n";
+    cleanup();
+}
+
+void test_create_index_unknown_table_rejected() {
+    cleanup();
+    Env env;
+
+    auto r = exec(env, "CREATE INDEX idx_bad ON no_such_table (id);");
+    assert(!r.success);
+
+    std::cout << "[PASS] CREATE INDEX on an unknown table is rejected\n";
+    cleanup();
+}
+
+void test_create_unique_index_rejects_existing_duplicates() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE users (id INT PRIMARY KEY, country VARCHAR(20));");
+    exec(env, "INSERT INTO users VALUES (1, 'IN');");
+    exec(env, "INSERT INTO users VALUES (2, 'IN');");  // duplicate country
+
+    auto r = exec(env, "CREATE UNIQUE INDEX idx_country_unique ON users (country);");
+    assert(!r.success);
+
+    bool leaked_partial_entry = true;
+    try {
+        env.cat.get_index("idx_country_unique");
+    } catch (const std::exception&) {
+        leaked_partial_entry = false;  // expected: no partial catalog entry survives the rejection
+    }
+    assert(!leaked_partial_entry);
+
+    std::cout << "[PASS] CREATE UNIQUE INDEX rejected on pre-existing duplicates, no partial catalog entry\n";
+    cleanup();
+}
+
+void test_index_stays_live_after_creation() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE users (id INT PRIMARY KEY, country VARCHAR(20));");
+    exec(env, "INSERT INTO users VALUES (1, 'IN');");
+    exec(env, "INSERT INTO users VALUES (2, 'IN');");
+    exec(env, "INSERT INTO users VALUES (3, 'US');");
+    exec(env, "CREATE INDEX idx_country ON users (country);");
+
+    // Post-creation writes must keep flowing through the index — this is
+    // exactly what open_indexes()/persist_index_roots() exist to guarantee.
+    exec(env, "INSERT INTO users VALUES (5, 'IN');");
+    exec(env, "UPDATE users SET country = 'US' WHERE id = 2;");
+    exec(env, "DELETE FROM users WHERE id = 3;");
+    // started IN={1,2}, US={3}; +5(IN); 2 moves IN->US; 3 deleted
+    // expected: IN={1,5}, US={2}
+
+    const TableSchema& tschema = env.cat.get_table("users");
+    Index idx(env.cat.get_index("idx_country"), tschema.primary_key_indices.size(), env.bp, env.wal, env.fl);
+    assert(idx.find(Key{Value(std::string("IN"))}).size() == 2);
+    assert(idx.find(Key{Value(std::string("US"))}).size() == 1);
+
+    std::cout << "[PASS] index stays in sync across INSERT/UPDATE/DELETE after CREATE INDEX\n";
+    cleanup();
+}
+
+// ─────────────────────────────────────────────
+// Index-Assisted Query Tests
+// ─────────────────────────────────────────────
+//
+// Covers execute_select / execute_select_aggregate / execute_update /
+// execute_delete picking a usable secondary index for an equality WHERE
+// clause (find_index_prefix / scan_with_index) instead of a full
+// Table::scan(), and falling back correctly whenever no index fits.
+
+static void seed_people(Env& env) {
+    exec(env, "CREATE TABLE people (id INT PRIMARY KEY, dept VARCHAR(20), age INT, score FLOAT);");
+    for (int i = 1; i <= 50; i++) {
+        std::string dept = (i % 5 == 0) ? "eng" : "sales";
+        std::string q = "INSERT INTO people VALUES (" + std::to_string(i) + ", '" + dept +
+                         "', " + std::to_string(20 + (i % 10)) + ", " + std::to_string(i) + ".0);";
+        exec(env, q);
+    }
+    exec(env, "CREATE INDEX idx_dept ON people (dept);");
+    exec(env, "CREATE INDEX idx_dept_age ON people (dept, age);");
+    exec(env, "CREATE UNIQUE INDEX idx_id_dup ON people (id);");
+    exec(env, "CREATE INDEX idx_score ON people (score);");
+}
+
+void test_select_equality_uses_single_column_index() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    auto r = exec(env, "SELECT id FROM people WHERE dept = 'eng';");
+    assert(r.success);
+    assert(r.rows.size() == 10);  // every 5th row, 1..50
+
+    std::cout << "[PASS] equality WHERE on a single-column index returns correct rows\n";
+    cleanup();
+}
+
+void test_select_composite_index_leftmost_prefix() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // Only the first column of the composite (dept, age) index is given —
+    // must still work as a leftmost-prefix lookup.
+    auto r = exec(env, "SELECT id FROM people WHERE dept = 'sales';");
+    assert(r.success);
+    assert(r.rows.size() == 40);
+
+    std::cout << "[PASS] composite index used via leftmost prefix (first column only)\n";
+    cleanup();
+}
+
+void test_select_composite_index_full_match() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    auto r = exec(env, "SELECT id FROM people WHERE dept = 'eng' AND age = 25;");
+    assert(r.success);
+    int expected = 0;
+    for (int i = 5; i <= 50; i += 5) {
+        if (20 + (i % 10) == 25) expected++;
+    }
+    assert(static_cast<int>(r.rows.size()) == expected);
+
+    std::cout << "[PASS] composite index full two-column equality match returns correct rows\n";
+    cleanup();
+}
+
+void test_select_index_candidates_still_filtered_by_full_predicate() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // 'score > 40' isn't part of any index equality — index only narrows on
+    // dept, every candidate must still be checked against the full WHERE.
+    auto r = exec(env, "SELECT id FROM people WHERE dept = 'eng' AND score > 40;");
+    assert(r.success);
+    int expected = 0;
+    for (int i = 5; i <= 50; i += 5) if (i > 40) expected++;
+    assert(static_cast<int>(r.rows.size()) == expected);
+
+    std::cout << "[PASS] index-narrowed candidates are still filtered by the full predicate\n";
+    cleanup();
+}
+
+void test_select_int_literal_against_float_column_is_coerced() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // score is FLOAT and stores 7.0f; the literal '7' parses as int32_t —
+    // without coercion, a raw index-key lookup would silently miss it.
+    auto r = exec(env, "SELECT id FROM people WHERE score = 7;");
+    assert(r.success);
+    assert(r.rows.size() == 1);
+    assert(r.rows[0][0] == "7");
+
+    std::cout << "[PASS] int literal against a FLOAT indexed column is coerced and matched\n";
+    cleanup();
+}
+
+void test_select_or_clause_not_incorrectly_narrowed() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // A top-level OR must not be narrowed down to just the 'dept' side —
+    // both branches have to be considered.
+    auto r = exec(env, "SELECT id FROM people WHERE dept = 'eng' OR score > 45;");
+    assert(r.success);
+    int expected = 0;
+    for (int i = 1; i <= 50; i++) {
+        bool eng = (i % 5 == 0);
+        bool hi  = (i > 45);
+        if (eng || hi) expected++;
+    }
+    assert(static_cast<int>(r.rows.size()) == expected);
+
+    std::cout << "[PASS] OR at the top level is not incorrectly narrowed by an index\n";
+    cleanup();
+}
+
+void test_select_count_aggregate_uses_index() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    auto r = exec(env, "SELECT COUNT(*) FROM people WHERE dept = 'eng';");
+    assert(r.success);
+    assert(r.rows[0][0] == "10");
+
+    std::cout << "[PASS] COUNT(*) aggregate uses an index-assisted scan correctly\n";
+    cleanup();
+}
+
+void test_update_where_indexed_equality() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    auto r = exec(env, "UPDATE people SET age = 99 WHERE dept = 'eng' AND age = 25;");
+    assert(r.success);
+
+    auto check = exec(env, "SELECT id FROM people WHERE age = 99;");
+    assert(check.success);
+    assert(check.rows.size() == r.rows_affected);
+
+    std::cout << "[PASS] UPDATE with an indexable WHERE updates exactly the right rows ("
+              << r.rows_affected << ")\n";
+    cleanup();
+}
+
+void test_delete_where_unique_index_deletes_one_row() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    auto r = exec(env, "DELETE FROM people WHERE id = 3;");
+    assert(r.success);
+    assert(r.rows_affected == 1);
+
+    auto check = exec(env, "SELECT id FROM people WHERE id = 3;");
+    assert(check.success);
+    assert(check.rows.empty());
+
+    std::cout << "[PASS] DELETE via a unique index deletes exactly the targeted row\n";
+    cleanup();
+}
+
+void test_delete_where_nonunique_index_deletes_all_matches() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    auto before = exec(env, "SELECT id FROM people WHERE dept = 'eng';");
+    size_t n = before.rows.size();
+
+    auto r = exec(env, "DELETE FROM people WHERE dept = 'eng';");
+    assert(r.success);
+    assert(r.rows_affected == n);
+
+    auto after = exec(env, "SELECT id FROM people WHERE dept = 'eng';");
+    assert(after.success);
+    assert(after.rows.empty());
+
+    std::cout << "[PASS] DELETE via a non-unique index deletes every matching row (" << n << ")\n";
+    cleanup();
+}
+
+// ─────────────────────────────────────────────
 // Persistence Test
 // ─────────────────────────────────────────────
 
@@ -607,6 +911,26 @@ int main() {
     test_inner_join();
     test_inner_join_no_match();
     test_left_join_preserves_unmatched();
+
+    std::cout << "\n=== CREATE INDEX Tests ===\n";
+    test_create_index_backfills_existing_rows();
+    test_create_index_duplicate_name_rejected();
+    test_create_index_unknown_column_rejected();
+    test_create_index_unknown_table_rejected();
+    test_create_unique_index_rejects_existing_duplicates();
+    test_index_stays_live_after_creation();
+
+    std::cout << "\n=== Index-Assisted Query Tests ===\n";
+    test_select_equality_uses_single_column_index();
+    test_select_composite_index_leftmost_prefix();
+    test_select_composite_index_full_match();
+    test_select_index_candidates_still_filtered_by_full_predicate();
+    test_select_int_literal_against_float_column_is_coerced();
+    test_select_or_clause_not_incorrectly_narrowed();
+    test_select_count_aggregate_uses_index();
+    test_update_where_indexed_equality();
+    test_delete_where_unique_index_deletes_one_row();
+    test_delete_where_nonunique_index_deletes_all_matches();
 
     std::cout << "\n=== Persistence Tests ===\n";
     test_data_survives_restart();

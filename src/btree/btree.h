@@ -59,8 +59,33 @@ public:
 
     // inserts a key-value pair. Throws if the key already exists.
     // may cause node splits, which can change the root page.
-    // Runs as a single WAL transaction covering every page touched.
+    // Runs as a single WAL transaction covering every page touched,
+    // which this overload opens and commits itself.
     void insert(const Key& key, const std::vector<uint8_t>& value);
+
+    // Same operation as above, but rides inside a transaction the caller
+    // already opened via wal_.begin() (transaction_id), instead of
+    // opening/committing its own. Does not call wal_.commit() — the
+    // caller owns that, once every BTree (and any other WAL-writing
+    // object) it touched under transaction_id is done.
+    //
+    // This is what lets a single logical write — e.g. Table::insert()
+    // writing the primary-key tree and every secondary index's tree for
+    // one row — become durable as one atomic unit instead of several
+    // independent commits. See the plain insert() above for the
+    // self-contained version most callers should use; use this overload
+    // only when coordinating multiple BTree/Index writes under one
+    // caller-owned transaction.
+    //
+    // IMPORTANT: because page mutations happen in-place in the buffer
+    // pool immediately (before any wal_.write()/commit()), this does NOT
+    // provide rollback if a later step under the same transaction_id
+    // fails — wal_.abort() only discards the pending redo log, not
+    // in-memory page state already mutated by an earlier step. Callers
+    // coordinating multiple writes under one transaction must validate
+    // everything that can fail (e.g. unique constraint checks) *before*
+    // issuing any of the writes, not rely on aborting partway through.
+    void insert(uint32_t transaction_id, const Key& key, const std::vector<uint8_t>& value);
 
     // searches for a key. Returns the value if found, std::nullopt otherwise.
     // Read-only — does not open a transaction.
@@ -70,13 +95,44 @@ public:
     // handles underflow via redistribution or merging, cascading upward
     // through parent nodes as needed.
     // Runs as a single WAL transaction covering every page touched,
-    // including any pages freed back to the free list via merges.
+    // including any pages freed back to the free list via merges. This
+    // overload opens and commits that transaction itself.
     void remove(const Key& key);
+
+    // Same operation as above, but rides inside a caller-owned
+    // transaction_id instead of opening/committing its own — see the
+    // transaction_id overload of insert() above for the full rationale
+    // and the same rollback caveat (validate before writing; this does
+    // not undo earlier writes made under the same transaction_id).
+    void remove(uint32_t transaction_id, const Key& key);
 
     // returns all key-value pairs with start <= key <= end (lexicographic
     // tuple comparison), in ascending order.
     // uses the leaf linked list for efficient range scanning.
     std::vector<std::pair<Key, std::vector<uint8_t>>> range_scan(const Key& start, const Key& end) const;
+
+    // returns all key-value pairs whose key *begins with* `prefix` — i.e.
+    // every key K where K.size() >= prefix.size() and K[0..prefix.size())
+    // == prefix element-wise — in ascending order.
+    //
+    // This is deliberately a separate method from range_scan(), not just
+    // range_scan(prefix, prefix): because Key is variable-arity and
+    // std::vector<Value>'s lexicographic ordering says a shorter vector
+    // is "less than" a longer one sharing the same leading elements
+    // (i.e. {5} < {5, "x"}), range_scan(start={5}, end={5}) would see the
+    // very first {5, "x"} entry compare *greater* than the end bound and
+    // stop immediately — it can never see anything under a plain prefix
+    // this way. There is also no generic "maximum possible value" to use
+    // as a synthetic end bound instead (no true max string, and the
+    // suffix's type/arity isn't known at this layer). So this walks the
+    // leaf chain and tests each key's leading elements directly instead
+    // of relying on a start/end bound comparison.
+    //
+    // This is the primary lookup path for a secondary index: an index
+    // entry's raw key is {indexed_value..., primary_key...} (see the
+    // Index class), so "find every row with indexed_value == X" is
+    // exactly prefix_scan({X}).
+    std::vector<std::pair<Key, std::vector<uint8_t>>> prefix_scan(const Key& prefix) const;
 
     // returns all key-value pairs in the tree, in ascending order.
     std::vector<std::pair<Key, std::vector<uint8_t>>> scan_all() const;

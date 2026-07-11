@@ -80,8 +80,10 @@ Statement Parser::parse_statement() {
     if (check(TokenType::CREATE)) {
         advance();
         if (check(TokenType::TABLE))    return parse_create_table();
+        if (check(TokenType::INDEX))    return parse_create_index();
+        if (check(TokenType::UNIQUE))   return parse_create_index();
         if (check(TokenType::DATABASE)) return parse_create_database();
-        throw std::runtime_error(error_msg("TABLE or DATABASE after CREATE"));
+        throw std::runtime_error(error_msg("TABLE, INDEX, UNIQUE INDEX, or DATABASE after CREATE"));
     }
     if (check(TokenType::USE))  return parse_use();
     if (check(TokenType::SHOW)) return parse_show();
@@ -383,6 +385,27 @@ Statement Parser::parse_drop_table() {
     expect(TokenType::TABLE, "DROP TABLE");
     DropTableStmt stmt;
     stmt.table_name = expect(TokenType::IDENTIFIER, "DROP TABLE name").value;
+    return stmt;
+}
+
+// ─────────────────────────────────────────────
+// CREATE INDEX
+// ─────────────────────────────────────────────
+
+// CREATE [UNIQUE] INDEX index_name ON table_name (col1 [, col2, ...])
+Statement Parser::parse_create_index() {
+    CreateIndexStmt stmt;
+
+    if (match(TokenType::UNIQUE)) {
+        stmt.is_unique = true;
+    }
+    expect(TokenType::INDEX, "CREATE INDEX");
+
+    stmt.index_name = expect(TokenType::IDENTIFIER, "CREATE INDEX name").value;
+    expect(TokenType::ON, "CREATE INDEX ... ON table");
+    stmt.table_name = expect(TokenType::IDENTIFIER, "CREATE INDEX ON table name").value;
+    stmt.column_names = parse_column_list();
+
     return stmt;
 }
 

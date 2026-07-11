@@ -1,6 +1,9 @@
 #include "executor.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 
@@ -35,6 +38,37 @@ static bool like_match(const std::string& text,
     return false;
 }
 
+// Coerces a WHERE literal to the type an indexed column actually stores,
+// mirroring the int/float promotion evaluate_compare's EQ case already
+// applies (see the std::visit block there). A raw B+ tree key comparison
+// (unlike evaluate_compare) requires an exact Value-alternative match, so
+// without this, a perfectly valid `WHERE float_col = 5` would silently fail
+// to find an index entry stored as float 5.0f, even though evaluate_compare
+// would call the two equal. Returns nullopt if the value can never equal
+// anything stored in a column of this type (e.g. a fractional float against
+// an INT column) — the caller treats that the same as "no equality found for
+// this column", which is always safe (it just stops the prefix short).
+static std::optional<Value> coerce_equality_value(const Value& v, ColumnType col_type)
+{
+    if (col_type == ColumnType::FLOAT && std::holds_alternative<int32_t>(v)) {
+        return Value{static_cast<float>(std::get<int32_t>(v))};
+    }
+    if (col_type == ColumnType::INT && std::holds_alternative<float>(v)) {
+        float f = std::get<float>(v);
+        float rounded = std::round(f);
+        if (rounded == f &&
+            f >= static_cast<float>(std::numeric_limits<int32_t>::min()) &&
+            f <= static_cast<float>(std::numeric_limits<int32_t>::max())) {
+            return Value{static_cast<int32_t>(rounded)};
+        }
+        return std::nullopt;  // fractional/out-of-range float can never equal an INT column
+    }
+    // Already the matching type, or a combination evaluate_compare treats as
+    // "never equal" anyway (e.g. VARCHAR vs INT) — an index lookup on such a
+    // mismatched key correctly finds nothing either, so no coercion needed.
+    return v;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constructor
 // ─────────────────────────────────────────────────────────────────────────────
@@ -44,6 +78,149 @@ Executor::Executor(CatalogManager& catalog,
                    WALManager&     wal,
                    FreeListManager& free_list)
     : catalog_(catalog), buffer_pool_(buffer_pool), wal_(wal), free_list_(free_list) {}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Index loading — see executor.h for why this exists
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::vector<std::unique_ptr<Index>> Executor::open_indexes(const TableSchema& schema) const
+{
+    std::vector<std::unique_ptr<Index>> result;
+
+    // get_indexes_for_table returns copies (see CatalogManager), so it's
+    // only used here to discover *names*. The Index objects themselves are
+    // built against catalog_.get_index(name), which returns a reference
+    // into CatalogManager's own long-lived storage — the same stability
+    // guarantee Table already relies on for its `schema` reference.
+    for (const auto& summary : catalog_.get_indexes_for_table(schema.name)) {
+        const IndexSchema& ischema = catalog_.get_index(summary.name);
+        result.push_back(std::make_unique<Index>(
+            ischema, schema.primary_key_indices.size(),
+            buffer_pool_, wal_, free_list_));
+    }
+    return result;
+}
+
+std::vector<Index*> Executor::index_ptrs(const std::vector<std::unique_ptr<Index>>& owned)
+{
+    std::vector<Index*> ptrs;
+    ptrs.reserve(owned.size());
+    for (const auto& idx : owned) ptrs.push_back(idx.get());
+    return ptrs;
+}
+
+void Executor::persist_index_roots(const Table& tbl) const
+{
+    for (const auto& [index_name, root_page] : tbl.index_root_pages()) {
+        catalog_.update_index_root(index_name, root_page);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Index-assisted scans — see executor.h for why this exists
+// ─────────────────────────────────────────────────────────────────────────────
+
+void Executor::collect_and_equalities(const WhereExprPtr& expr,
+                                       const TableSchema&  schema,
+                                       const std::string&  alias,
+                                       std::vector<std::pair<std::string, Value>>& out) const
+{
+    if (!expr) return;
+
+    if (expr->kind == WhereExpr::Kind::LOGICAL) {
+        if (expr->logical_op == LogicalOp::AND) {
+            collect_and_equalities(expr->left,  schema, alias, out);
+            collect_and_equalities(expr->right, schema, alias, out);
+        }
+        // OR / NOT: neither side (or the negated subtree) is a condition
+        // every matching row must satisfy, so nothing here is safe to use
+        // as an index seed — contribute nothing.
+        return;
+    }
+
+    // EXISTS carries no column-level equality of its own.
+    if (expr->kind == WhereExpr::Kind::EXISTS) return;
+
+    const CompareExpr& c = expr->compare;
+    if (c.op != CompareOp::EQ)   return;  // only plain equality narrows to a point lookup
+    if (c.operand_column)        return;  // column = column can't seed a literal key
+    if (c.subquery)               return;  // (defensive — EQ never carries a subquery today)
+    if (is_null(c.operand))      return;  // "col = NULL" never matches anything (SQL semantics)
+
+    // Only a reference to THIS table's columns is usable — an unqualified
+    // ref always is; a qualified one must match this table's name or alias.
+    if (!c.column.table_name.empty() && !table_name_matches(c.column.table_name, schema, alias))
+        return;
+
+    out.emplace_back(c.column.column_name, c.operand);
+}
+
+std::optional<std::pair<const IndexSchema*, Key>> Executor::find_index_prefix(
+    const WhereExprPtr& where,
+    const TableSchema&  schema,
+    const std::string&  alias) const
+{
+    if (!where) return std::nullopt;
+
+    std::vector<std::pair<std::string, Value>> equalities;
+    collect_and_equalities(where, schema, alias, equalities);
+    if (equalities.empty()) return std::nullopt;
+
+    const IndexSchema* best = nullptr;
+    Key                 best_prefix;
+
+    for (const auto& summary : catalog_.get_indexes_for_table(schema.name)) {
+        Key prefix;
+        for (const std::string& col_name : summary.column_names) {
+            const Value* found = nullptr;
+            for (const auto& [cname, val] : equalities) {
+                if (cname == col_name) { found = &val; break; }
+            }
+            if (!found) break;  // leftmost prefix stops at the first uncovered column
+
+            int col_idx = schema.column_index(col_name);
+            if (col_idx < 0) break;  // shouldn't happen — defensive
+            auto coerced = coerce_equality_value(*found, schema.columns[static_cast<size_t>(col_idx)].type);
+            if (!coerced) break;  // literal can never equal this column's type
+
+            prefix.push_back(std::move(*coerced));
+        }
+        if (prefix.size() > best_prefix.size()) {
+            best_prefix = std::move(prefix);
+            best        = &catalog_.get_index(summary.name);  // stable reference, see open_indexes
+        }
+    }
+
+    if (!best) return std::nullopt;
+    return std::make_pair(best, std::move(best_prefix));
+}
+
+std::vector<ScanResult> Executor::scan_with_index(const Table&         tbl,
+                                                    const TableSchema&  schema,
+                                                    const WhereExprPtr& where,
+                                                    const Predicate&    pred,
+                                                    const std::string&  alias) const
+{
+    auto index_match = find_index_prefix(where, schema, alias);
+    if (!index_match) {
+        return tbl.scan(pred);
+    }
+
+    const IndexSchema& ischema = *index_match->first;
+    Index idx(ischema, schema.primary_key_indices.size(), buffer_pool_, wal_, free_list_);
+
+    std::vector<ScanResult> results;
+    for (const Key& pk : idx.find(index_match->second)) {
+        std::optional<Row> row = tbl.select_by_key(pk);
+        // Every fetched row is still run through the full predicate — the
+        // index only narrowed candidates by its equality prefix, but the
+        // WHERE clause may have additional conditions beyond it.
+        if (row && pred(*row)) {
+            results.push_back({pk, std::move(*row)});
+        }
+    }
+    return results;
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // execute() — top-level dispatch, never throws
@@ -66,6 +243,8 @@ QueryResult Executor::execute(const Statement& stmt)
                 return execute_create_table(s);
             if constexpr (std::is_same_v<T, DropTableStmt>)
                 return execute_drop_table(s);
+            if constexpr (std::is_same_v<T, CreateIndexStmt>)
+                return execute_create_index(s);
             if constexpr (std::is_same_v<T, ShowStmt>)
                 return execute_show(s);
             if constexpr (std::is_same_v<T, CreateDatabaseStmt>)
@@ -216,6 +395,109 @@ QueryResult Executor::execute_drop_table(const DropTableStmt& stmt)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CREATE INDEX
+// ─────────────────────────────────────────────────────────────────────────────
+
+QueryResult Executor::execute_create_index(const CreateIndexStmt& stmt)
+{
+    if (!catalog_.table_exists(stmt.table_name)) {
+        return {false, "CREATE INDEX: table '" + stmt.table_name + "' does not exist"};
+    }
+    const TableSchema& schema = catalog_.get_table(stmt.table_name);
+
+    if (stmt.column_names.empty()) {
+        return {false, "CREATE INDEX '" + stmt.index_name + "': no columns specified"};
+    }
+
+    // Resolve column names to indices up front — this is also what lets us
+    // read each existing row's indexed value below without re-resolving
+    // per row.
+    std::vector<int> col_indices;
+    col_indices.reserve(stmt.column_names.size());
+    for (const std::string& col_name : stmt.column_names) {
+        int idx = schema.column_index(col_name);
+        if (idx < 0) {
+            return {false, "CREATE INDEX '" + stmt.index_name + "': column '" +
+                           col_name + "' does not exist on table '" + stmt.table_name + "'"};
+        }
+        col_indices.push_back(idx);
+    }
+
+    // ── Scan the existing table and collect (indexed_value, primary_key)
+    //    pairs for every row — this is the "backfill on an already-built
+    //    table" step. Rows with a NULL in any indexed column are skipped
+    //    entirely, matching Index::is_indexable semantics (NULLs are never
+    //    indexed and never subject to uniqueness).
+    Table no_index_tbl(schema, buffer_pool_, wal_, free_list_);  // plain scan, no indexes attached
+    std::vector<std::pair<Key, Key>> entries;  // {indexed_value, primary_key}
+
+    for (const auto& match : no_index_tbl.scan([](const Row&) { return true; })) {
+        Key indexed_value;
+        indexed_value.reserve(col_indices.size());
+        bool has_null = false;
+        for (int idx : col_indices) {
+            const Value& v = match.row.values[static_cast<size_t>(idx)];
+            if (std::holds_alternative<std::monostate>(v)) { has_null = true; break; }
+            indexed_value.push_back(v);
+        }
+        if (has_null) continue;
+
+        Key primary_key;
+        primary_key.reserve(schema.primary_key_indices.size());
+        for (uint32_t pk_idx : schema.primary_key_indices) {
+            primary_key.push_back(match.row.values[pk_idx]);
+        }
+        entries.emplace_back(std::move(indexed_value), std::move(primary_key));
+    }
+
+    // ── Pre-validate UNIQUE across the existing data BEFORE anything is
+    //    written — Index/BTree writes can't be rolled back once made (see
+    //    Index::check_unique's comment), so a violation must be caught here,
+    //    while the catalog and B+ tree for this index don't exist yet.
+    if (stmt.is_unique) {
+        std::set<Key> seen_values;
+        for (const auto& [indexed_value, primary_key] : entries) {
+            (void)primary_key;
+            if (!seen_values.insert(indexed_value).second) {
+                return {false, "CREATE INDEX '" + stmt.index_name +
+                               "': cannot create UNIQUE index — table '" + stmt.table_name +
+                               "' already has duplicate values for the indexed column(s)"};
+            }
+        }
+    }
+
+    // ── Register the index (root_page = INVALID_PAGE for now) and allocate
+    //    its empty B+ tree — same two-step pattern execute_create_table uses
+    //    for the table's own root page.
+    IndexSchema index_schema;
+    index_schema.name         = stmt.index_name;
+    index_schema.table_name   = stmt.table_name;
+    index_schema.column_names = stmt.column_names;
+    index_schema.root_page    = INVALID_PAGE;
+    index_schema.is_unique    = stmt.is_unique;
+
+    catalog_.create_index(index_schema);  // throws (caught by execute()) if name is taken
+
+    Index idx(catalog_.get_index(stmt.index_name), schema.primary_key_indices.size(),
+               buffer_pool_, wal_, free_list_);
+
+    // ── Backfill every collected entry in one WAL transaction, rather than
+    //    one commit per row — the difference between one transaction and N
+    //    of them for a large table.
+    if (!entries.empty()) {
+        uint32_t transaction_id = wal_.begin();
+        for (const auto& [indexed_value, primary_key] : entries) {
+            idx.insert_entry(transaction_id, indexed_value, primary_key);
+        }
+        wal_.commit(transaction_id);
+    }
+
+    catalog_.update_index_root(stmt.index_name, idx.root_page());
+
+    return {true, "", {}, {}, 0};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // INSERT
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -262,13 +544,15 @@ QueryResult Executor::execute_insert(const InsertStmt& stmt)
                        check_op_symbol(c.op) + " " + value_to_string(c.operand) + ")"};
     }
 
-    Table tbl(schema, buffer_pool_, wal_, free_list_);
-    tbl.insert(row);  // throws on NOT NULL / duplicate PK / type mismatch
+    auto  owned_indexes = open_indexes(schema);
+    Table tbl(schema, buffer_pool_, wal_, free_list_, index_ptrs(owned_indexes));
+    tbl.insert(row);  // throws on NOT NULL / duplicate PK / type mismatch / UNIQUE index violation
 
     // B+ tree root may have changed after a root split — keep catalog in sync
     if (tbl.root_page() != schema.root_page) {
         catalog_.update_table_root(stmt.table_name, tbl.root_page());
     }
+    persist_index_roots(tbl);
 
     return {true, "", {}, {}, 1};
 }
@@ -351,7 +635,8 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
     if (stmt.joins.empty()) {
         // ── Simple (no JOIN) path ─────────────────────────────────────────────
         Predicate pred = build_predicate(stmt.where, schema, nullptr, nullptr, stmt.table_alias);
-        std::vector<ScanResult> rows = left_tbl.scan(pred);
+        std::vector<ScanResult> rows =
+            scan_with_index(left_tbl, schema, stmt.where, pred, stmt.table_alias);
 
         // ORDER BY (only first clause honoured — no secondary sort key)
         if (!stmt.order_by.empty()) {
@@ -434,7 +719,7 @@ QueryResult Executor::execute_select_aggregate(const SelectStmt&  stmt,
                                                 Table&              tbl) const
 {
     Predicate pred = build_predicate(stmt.where, schema, nullptr, nullptr, stmt.table_alias);
-    std::vector<ScanResult> rows = tbl.scan(pred);
+    std::vector<ScanResult> rows = scan_with_index(tbl, schema, stmt.where, pred, stmt.table_alias);
 
     QueryResult result;
     result.success = true;
@@ -566,14 +851,15 @@ QueryResult Executor::execute_update(const UpdateStmt& stmt)
         new_values.emplace_back(static_cast<size_t>(idx), asgn.value);
     }
 
-    Table     tbl(schema, buffer_pool_, wal_, free_list_);
+    auto      owned_indexes = open_indexes(schema);
+    Table     tbl(schema, buffer_pool_, wal_, free_list_, index_ptrs(owned_indexes));
     Predicate pred = build_predicate(stmt.where, schema);
 
     // Validate CHECK constraints against every row's post-update values
     // *before* touching storage — a single violation aborts the whole
     // UPDATE with no rows changed, matching CHECK's statement-level atomicity.
     if (!schema.checks.empty()) {
-        for (const auto& match : tbl.scan(pred)) {
+        for (const auto& match : scan_with_index(tbl, schema, stmt.where, pred)) {
             Row candidate = match.row;
             for (const auto& [idx, val] : new_values) {
                 candidate.values[idx] = val;
@@ -589,11 +875,25 @@ QueryResult Executor::execute_update(const UpdateStmt& stmt)
         }
     }
 
+    // The mutation itself deliberately still goes through Table::update_where
+    // (a full internal scan) rather than an index-narrowed key loop here:
+    // update_where's phase 1 validates every matched row's UNIQUE indexes
+    // against every OTHER row in the same batch (batch_claimed) before phase
+    // 2 writes any of them — so two rows in one UPDATE colliding on a new
+    // unique value is caught atomically, with nothing written. Driving the
+    // mutation from Executor with one tbl.update() call per matched key would
+    // lose that: each call commits immediately, so an interior collision
+    // would leave earlier rows already changed. The CHECK-constraint scan
+    // above is already index-narrowed (scan_with_index) — that's the
+    // expensive part when a large table has CHECK constraints; the WHERE
+    // re-scan update_where does internally afterward is comparatively cheap
+    // since it does no per-row validation logic beyond what's already here.
     uint32_t count = tbl.update_where(pred, new_values);
 
     if (tbl.root_page() != schema.root_page) {
         catalog_.update_table_root(stmt.table_name, tbl.root_page());
     }
+    persist_index_roots(tbl);
 
     return {true, "", {}, {}, count};
 }
@@ -606,13 +906,40 @@ QueryResult Executor::execute_delete(const DeleteStmt& stmt)
 {
     const TableSchema& schema = catalog_.get_table(stmt.table_name);
 
-    Table     tbl(schema, buffer_pool_, wal_, free_list_);
-    Predicate pred  = build_predicate(stmt.where, schema);
-    uint32_t  count = tbl.delete_where(pred);
+    auto      owned_indexes = open_indexes(schema);
+    Table     tbl(schema, buffer_pool_, wal_, free_list_, index_ptrs(owned_indexes));
+    Predicate pred = build_predicate(stmt.where, schema);
+
+    uint32_t count = 0;
+    auto index_match = find_index_prefix(stmt.where, schema);
+    if (index_match) {
+        // Index-assisted delete: fetch only candidate primary keys via the
+        // index, re-check each against the full predicate (the index only
+        // narrows candidates — see find_index_prefix), then delete each
+        // matched row directly. This is exactly what Table::delete_where does
+        // internally — collect matches, then delete each in its own
+        // transaction — just seeded from Index::find() instead of a full
+        // Table::scan(). Unlike UPDATE, DELETE has no cross-row validation to
+        // preserve (no UNIQUE-index batch collision is possible from
+        // removing rows), so there's no atomicity difference from the
+        // scan-based path below.
+        const IndexSchema& ischema = *index_match->first;
+        Index idx(ischema, schema.primary_key_indices.size(), buffer_pool_, wal_, free_list_);
+        for (const Key& pk : idx.find(index_match->second)) {
+            std::optional<Row> row = tbl.select_by_key(pk);
+            if (row && pred(*row)) {
+                tbl.delete_row(pk);
+                count++;
+            }
+        }
+    } else {
+        count = tbl.delete_where(pred);
+    }
 
     if (tbl.root_page() != schema.root_page) {
         catalog_.update_table_root(stmt.table_name, tbl.root_page());
     }
+    persist_index_roots(tbl);
 
     return {true, "", {}, {}, count};
 }

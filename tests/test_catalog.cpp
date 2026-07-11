@@ -318,19 +318,20 @@ void test_catalog_create_and_get_index() {
     cat.create_table(make_users_schema());
 
     IndexSchema idx;
-    idx.name        = "idx_name";
-    idx.table_name  = "users";
-    idx.column_name = "name";
-    idx.root_page   = INVALID_PAGE;
-    idx.is_unique   = false;
+    idx.name         = "idx_name";
+    idx.table_name   = "users";
+    idx.column_names = {"name"};
+    idx.root_page    = INVALID_PAGE;
+    idx.is_unique    = false;
 
     cat.create_index(idx);
 
     const IndexSchema& retrieved = cat.get_index("idx_name");
-    assert(retrieved.name        == "idx_name");
-    assert(retrieved.table_name  == "users");
-    assert(retrieved.column_name == "name");
-    assert(retrieved.is_unique   == false);
+    assert(retrieved.name         == "idx_name");
+    assert(retrieved.table_name   == "users");
+    assert(retrieved.column_names == std::vector<std::string>{"name"});
+    assert(retrieved.is_composite() == false);
+    assert(retrieved.is_unique    == false);
 
     std::cout << "[PASS] create_index and get_index work correctly\n";
     cleanup();
@@ -348,18 +349,18 @@ void test_catalog_get_indexes_for_table() {
     cat.create_table(make_users_schema());
 
     IndexSchema idx1;
-    idx1.name        = "idx_name";
-    idx1.table_name  = "users";
-    idx1.column_name = "name";
-    idx1.root_page   = INVALID_PAGE;
-    idx1.is_unique   = false;
+    idx1.name         = "idx_name";
+    idx1.table_name   = "users";
+    idx1.column_names = {"name"};
+    idx1.root_page    = INVALID_PAGE;
+    idx1.is_unique    = false;
 
     IndexSchema idx2;
-    idx2.name        = "idx_age";
-    idx2.table_name  = "users";
-    idx2.column_name = "age";
-    idx2.root_page   = INVALID_PAGE;
-    idx2.is_unique   = false;
+    idx2.name         = "idx_age";
+    idx2.table_name   = "users";
+    idx2.column_names = {"age"};
+    idx2.root_page    = INVALID_PAGE;
+    idx2.is_unique     = false;
 
     cat.create_index(idx1);
     cat.create_index(idx2);

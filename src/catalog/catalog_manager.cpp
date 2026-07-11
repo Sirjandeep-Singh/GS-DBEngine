@@ -265,7 +265,10 @@ std::vector<uint8_t> CatalogManager::serialize() const {
     for (auto& [_, idx] : indexes_) {
         write_string(buf, idx.name);
         write_string(buf, idx.table_name);
-        write_string(buf, idx.column_name);
+        write_uint32(buf, static_cast<uint32_t>(idx.column_names.size()));
+        for (auto& col_name : idx.column_names) {
+            write_string(buf, col_name);
+        }
         write_uint32(buf, idx.root_page);
         write_uint8(buf, idx.is_unique ? 1 : 0);
     }
@@ -324,7 +327,11 @@ void CatalogManager::deserialize(const std::vector<uint8_t>& data) {
         IndexSchema idx;
         idx.name        = read_string(data, pos);
         idx.table_name  = read_string(data, pos);
-        idx.column_name = read_string(data, pos);
+        uint32_t num_index_cols = read_uint32(data, pos);
+        idx.column_names.reserve(num_index_cols);
+        for (uint32_t j = 0; j < num_index_cols; j++) {
+            idx.column_names.push_back(read_string(data, pos));
+        }
         idx.root_page   = read_uint32(data, pos);
         idx.is_unique   = read_uint8(data, pos) != 0;
         indexes_[idx.name] = idx;

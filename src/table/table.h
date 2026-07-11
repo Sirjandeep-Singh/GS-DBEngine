@@ -12,6 +12,7 @@
 #include "../btree/free_list_manager.h"
 #include "../storage/buffer_pool.h"
 #include "../wal/wal_manager.h"
+#include "../index/index.h"
 
 // A ScanResult is a matched row plus its primary key.
 // The primary key is included so UPDATE and DELETE can locate the row for modification.
@@ -37,24 +38,50 @@ using Predicate = std::function<bool(const Row&)>;
 //   - Deserializing byte blobs from BTree back into Row objects
 //   - Auto-increment: tracking and assigning the next primary key
 //   - Filtering: applying predicates to rows during scans
+//   - Keeping every secondary Index passed to it in sync with the primary
+//     key tree — every INSERT/UPDATE/DELETE that touches the primary key
+//     tree also writes/removes the matching entry in each Index, as one
+//     atomic WAL transaction spanning all of them (see the "Index
+//     maintenance" section below, and BTree's transaction_id-threaded
+//     insert()/remove() overloads for why this has to be one transaction
+//     rather than several).
 //
 // The Table Layer does NOT:
 //   - Parse SQL
 //   - Handle JOINs
 //   - Manage schema persistence (that is CatalogManager's job)
 //   - Manage page I/O directly (that is BufferPool's job)
+//   - Decide *which* indexes exist on this table, or construct them —
+//     that's the caller's job (see the `indexes` constructor parameter)
 
 class Table {
 public:
     // schema    : the table's column definitions — owned by CatalogManager,
     //             Table holds a const reference and does not copy it
     // buffer_pool, wal, free_list : passed through to BTree
-    Table(const TableSchema& schema, BufferPool& buffer_pool, WALManager& wal, FreeListManager& free_list);
+    // indexes   : every secondary Index on this table, already constructed
+    //             by the caller (see Index maintenance notes above) — Table
+    //             holds these as non-owning pointers, same as it holds
+    //             `schema` by const reference. Empty by default, so
+    //             existing callers with no indexes don't need to change.
+    //             Every entry's Index::schema().table_name must equal
+    //             schema.name (checked in the constructor).
+    Table(const TableSchema& schema, BufferPool& buffer_pool, WALManager& wal, FreeListManager& free_list,
+          std::vector<Index*> indexes = {});
 
     // returns the current root page_id of the underlying B+ tree.
     // the caller (executor/database class) must persist this via
     // CatalogManager::update_table_root() whenever it changes after an insert.
     uint32_t root_page() const;
+
+    // returns {index_name, current_root_page} for every index passed to
+    // this Table, in the same order they were given. Read after any
+    // mutating call (insert/update/delete/*_where) — the caller must
+    // persist each one via CatalogManager::update_index_root() the same
+    // way it already does for root_page() above, since an index's B+
+    // tree root can change on any write to it, exactly like the primary
+    // key tree's root can.
+    std::vector<std::pair<std::string, uint32_t>> index_root_pages() const;
 
     // ---- INSERT ----
 
@@ -64,6 +91,10 @@ public:
     // only applies to a single-column INT primary key (never a composite one).
     // throws if a non-auto-increment primary key is NULL.
     // throws if the primary key already exists (duplicate).
+    // throws if this row's value violates a UNIQUE index on this table.
+    // Every check that can throw runs BEFORE any page is written — see
+    // "Index maintenance" below — so a thrown exception here means
+    // nothing was written at all, to the primary key tree or any index.
     // returns the primary key that was inserted (useful for auto-increment).
     Key insert(Row row);
 
@@ -85,6 +116,8 @@ public:
     // implemented as delete + reinsert to handle variable-size rows correctly.
     // throws if the primary key does not exist.
     // throws if new_values attempts to change a primary key column.
+    // throws if the resulting row violates a UNIQUE index on this table —
+    // checked, like insert(), before any page is written.
     void update(const Key& key, const std::vector<std::pair<size_t, Value>>& new_values);
 
     // ---- DELETE ----
@@ -107,17 +140,64 @@ public:
 private:
     const TableSchema& schema_;
     BTree              btree_;
+    // Needed so Table can open/commit its own WAL transactions that span
+    // btree_ plus every index in indexes_ — see the "Index maintenance"
+    // section above. BTree already holds its own reference to the same
+    // WALManager internally; this is a separate reference at the Table
+    // level because index maintenance needs to open ONE transaction that
+    // covers btree_ and every Index's tree together, which none of those
+    // objects can do on their own.
+    WALManager&        wal_;
     // next value for an auto-increment PK column. Only meaningful when the
     // primary key is a single-column INT with auto_increment set — a
     // composite primary key can never be auto-increment (see insert()).
     uint32_t           next_auto_increment_;
+
+    // One entry per Index passed to the constructor: the Index itself,
+    // plus its indexed column(s) pre-resolved to column indices into
+    // schema_.columns (resolved once here, instead of a string lookup
+    // per row on every write).
+    struct IndexBinding {
+        Index*                 index;
+        std::vector<uint32_t>  column_indices;
+    };
+    std::vector<IndexBinding> indexes_;
 
     // builds the BTree Key for a row: the tuple of values at
     // schema_.primary_key_indices, in order. Throws if any primary key
     // column holds NULL (a primary key value can never be NULL).
     Key extract_primary_key(const Row& row) const;
 
+    // builds the indexed-value Key for a row, for one IndexBinding: the
+    // tuple of values at binding.column_indices, in order. Unlike
+    // extract_primary_key, does NOT throw on NULL — an indexed column
+    // may legally be NULL (Index::is_indexable is what decides such a
+    // row is simply never entered into that index, not an error).
+    Key extract_indexed_value(const Row& row, const IndexBinding& binding) const;
+
     // initializes next_auto_increment_ by scanning the tree for the current max key.
     // no-op (stays at 1) when the primary key isn't a single auto-increment INT column.
     void init_auto_increment();
+
+    // Runs every IndexBinding's Index::check_unique() for `primary_key`'s
+    // row against `row`'s current values, throwing on the first
+    // violation found. Called before any page is written, for both
+    // insert() and update() — see the class-level "Index maintenance"
+    // note for why validation has to happen up front rather than via
+    // rollback after a write fails partway through.
+    void check_all_unique_constraints(const Row& row, const Key& primary_key) const;
+
+    // Writes `bytes` for `primary_key` into btree_, and inserts the
+    // matching entry into every index in indexes_ derived from `row` —
+    // all under one transaction_id the caller already opened via
+    // wal_.begin(). Does not call check_all_unique_constraints() itself;
+    // the caller must have already validated everything that can throw,
+    // since none of these writes can be rolled back once issued.
+    void write_row_and_indexes(uint32_t transaction_id, const Key& primary_key,
+                                const Row& row, const std::vector<uint8_t>& bytes);
+
+    // Removes `primary_key` from btree_, and removes the matching entry
+    // from every index in indexes_ derived from `old_row` — all under
+    // one transaction_id the caller already opened via wal_.begin().
+    void remove_row_and_indexes(uint32_t transaction_id, const Key& primary_key, const Row& old_row);
 };

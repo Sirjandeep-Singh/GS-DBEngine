@@ -19,6 +19,7 @@
 //   DELETE FROM table [WHERE ...]
 //   CREATE TABLE name (col_def [, ...])
 //   DROP TABLE name
+//   CREATE [UNIQUE] INDEX name ON table (col1 [, col2, ...])
 //   CREATE DATABASE name
 //   DROP DATABASE name
 //   USE name
@@ -76,6 +77,7 @@ private:
     Statement parse_delete();
     Statement parse_create_table();
     Statement parse_drop_table();
+    Statement parse_create_index();
     Statement parse_create_database();
     Statement parse_drop_database();
     Statement parse_use();

@@ -105,7 +105,11 @@ std::optional<std::vector<uint8_t>> BTree::search(const Key& key) const {
 
 void BTree::insert(const Key& key, const std::vector<uint8_t>& value) {
     uint32_t transaction_id = wal_.begin();
+    insert(transaction_id, key, value);
+    wal_.commit(transaction_id);
+}
 
+void BTree::insert(uint32_t transaction_id, const Key& key, const std::vector<uint8_t>& value) {
     uint32_t leaf_page_id = find_leaf_page(key);
 
     Page* page = buffer_pool_.fetch_page(leaf_page_id);
@@ -130,8 +134,6 @@ void BTree::insert(const Key& key, const std::vector<uint8_t>& value) {
     }
 
     insert_into_leaf(transaction_id, leaf_page_id, key, value);
-
-    wal_.commit(transaction_id);
 }
 
 void BTree::insert_into_leaf(uint32_t transaction_id, uint32_t leaf_page_id, const Key& key, const std::vector<uint8_t>& value) {
@@ -390,9 +392,55 @@ std::vector<std::pair<Key, std::vector<uint8_t>>> BTree::range_scan(const Key& s
     return result;
 }
 
+namespace {
+// true if `key` begins with every element of `prefix`, in order.
+// A key shorter than prefix can never match. Equal-length is a match
+// exactly when the keys are equal.
+bool key_has_prefix(const Key& key, const Key& prefix) {
+    if (key.size() < prefix.size()) return false;
+    for (size_t i = 0; i < prefix.size(); i++) {
+        if (!(key[i] == prefix[i])) return false;
+    }
+    return true;
+}
+}
+
+std::vector<std::pair<Key, std::vector<uint8_t>>> BTree::prefix_scan(const Key& prefix) const {
+    std::vector<std::pair<Key, std::vector<uint8_t>>> result;
+
+    uint32_t current = find_leaf_page(prefix);
+
+    bool done = false;
+    while (current != INVALID_PAGE && !done) {
+        Page* page = buffer_pool_.fetch_page(current);
+        BTreeNode node(page);
+        auto entries = node.get_leaf_entries();
+        uint32_t next = node.next_leaf();
+        buffer_pool_.unpin_page(current, false);
+
+        for (auto& e : entries) {
+            // entries sorted ascending; anything strictly less than
+            // `prefix` sorts before the matching range and hasn't been
+            // reached yet (find_leaf_page can land slightly early, same
+            // as range_scan does for its start bound).
+            if (e.key < prefix) continue;
+            if (!key_has_prefix(e.key, prefix)) { done = true; break; }
+            result.emplace_back(e.key, e.value);
+        }
+
+        current = next;
+    }
+
+    return result;
+}
+
 void BTree::remove(const Key& key) {
     uint32_t transaction_id = wal_.begin();
+    remove(transaction_id, key);
+    wal_.commit(transaction_id);
+}
 
+void BTree::remove(uint32_t transaction_id, const Key& key) {
     std::vector<uint32_t> path;
     uint32_t leaf_page_id = find_leaf_page_with_path(key, path);
 
@@ -417,8 +465,6 @@ void BTree::remove(const Key& key) {
             handle_underflow(transaction_id, leaf_page_id, path);
         }
     }
-
-    wal_.commit(transaction_id);
 }
 
 void BTree::remove_from_leaf(uint32_t transaction_id, uint32_t leaf_page_id, const Key& key) {

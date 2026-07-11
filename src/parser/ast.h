@@ -202,6 +202,23 @@ struct DropTableStmt {
 };
 
 // ─────────────────────────────────────────────
+// CREATE INDEX statement
+// ─────────────────────────────────────────────
+
+// CREATE [UNIQUE] INDEX index_name ON table_name (col1, col2, ...)
+//
+// column_names may be a single column or several (composite index), same
+// "arity via vector" shape IndexSchema::column_names already uses.
+// Executor builds the B+ tree and backfills it from the table's existing
+// rows — CREATE INDEX is always valid on a table that already has data.
+struct CreateIndexStmt {
+    std::string              index_name;
+    std::string              table_name;
+    std::vector<std::string> column_names;
+    bool                     is_unique = false;
+};
+
+// ─────────────────────────────────────────────
 // CREATE DATABASE / DROP DATABASE / USE / SHOW
 // ─────────────────────────────────────────────
 
@@ -235,6 +252,7 @@ using Statement = std::variant<
     DeleteStmt,
     CreateTableStmt,
     DropTableStmt,
+    CreateIndexStmt,
     CreateDatabaseStmt,
     DropDatabaseStmt,
     UseStmt,

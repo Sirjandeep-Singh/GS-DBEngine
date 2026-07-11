@@ -207,6 +207,8 @@ TokenType Tokenizer::keyword_or_identifier(const std::string& word) {
     if (upper == "DATABASES")      return TokenType::DATABASES;
     if (upper == "DATABASE")       return TokenType::DATABASE;
     if (upper == "TABLES")         return TokenType::TABLES;
+    if (upper == "INDEX")          return TokenType::INDEX;
+    if (upper == "UNIQUE")         return TokenType::UNIQUE;
     if (upper == "AND")            return TokenType::AND;
     if (upper == "OR")             return TokenType::OR;
     if (upper == "NOT")            return TokenType::NOT;
@@ -259,6 +261,8 @@ std::string token_type_name(TokenType type) {
         case TokenType::DATABASES:       return "DATABASES";
         case TokenType::DATABASE:        return "DATABASE";
         case TokenType::TABLES:          return "TABLES";
+        case TokenType::INDEX:           return "INDEX";
+        case TokenType::UNIQUE:          return "UNIQUE";
         case TokenType::AND:             return "AND";
         case TokenType::OR:              return "OR";
         case TokenType::NOT:             return "NOT";

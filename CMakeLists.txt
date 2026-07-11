@@ -26,6 +26,7 @@ add_library(gsdb_lib STATIC
     src/btree/free_list_manager.cpp
     src/row/serializer.cpp
     src/table/table.cpp
+    src/index/index.cpp
     src/parser/tokenizer.cpp
     src/parser/parser.cpp
     src/executor/executor.cpp
@@ -54,8 +55,10 @@ set(TEST_NAMES
     test_catalog
     test_btree_node
     test_btree
+    test_index
     test_row
     test_table
+    test_table_indexes
     test_tokenizer
     test_parser
     test_executor
