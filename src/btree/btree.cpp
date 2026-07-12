@@ -434,6 +434,93 @@ std::vector<std::pair<Key, std::vector<uint8_t>>> BTree::prefix_scan(const Key& 
     return result;
 }
 
+uint32_t BTree::find_leftmost_leaf() const {
+    uint32_t current = root_page_;
+    while (true) {
+        Page* page = buffer_pool_.fetch_page(current);
+        BTreeNode node(page);
+        if (node.is_leaf()) {
+            buffer_pool_.unpin_page(current, false);
+            return current;
+        }
+        auto entries = node.get_internal_entries();
+        uint32_t leftmost_child = entries.empty() ? node.rightmost_child() : entries.front().child_page_id;
+        buffer_pool_.unpin_page(current, false);
+        current = leftmost_child;
+    }
+}
+
+std::vector<std::pair<Key, std::vector<uint8_t>>> BTree::bounded_scan(
+    const Key&                  prefix,
+    const std::optional<Value>& lo, bool lo_inclusive,
+    const std::optional<Value>& hi, bool hi_inclusive) const
+{
+    std::vector<std::pair<Key, std::vector<uint8_t>>> result;
+    if (!lo.has_value() && !hi.has_value()) {
+        // No bound at all — nothing here is a range restriction, so this
+        // isn't a valid bounded_scan call (the caller should have used
+        // prefix_scan instead). Match prefix_scan's own leftmost-prefix
+        // scan behavior rather than throwing, for defensive callers.
+        return prefix_scan(prefix);
+    }
+
+    // Starting leaf: descend to the lo bound directly if present (same
+    // "may land slightly early" caveat range_scan/prefix_scan already
+    // document); otherwise descend to the fixed prefix (if non-empty) or
+    // the true leftmost leaf (if scanning the whole tree from a bare
+    // range column with no lower bound at all).
+    uint32_t current;
+    if (lo.has_value()) {
+        Key start = prefix;
+        start.push_back(*lo);
+        current = find_leaf_page(start);
+    } else if (!prefix.empty()) {
+        current = find_leaf_page(prefix);
+    } else {
+        current = find_leftmost_leaf();
+    }
+
+    bool done = false;
+    while (current != INVALID_PAGE && !done) {
+        Page* page = buffer_pool_.fetch_page(current);
+        BTreeNode node(page);
+        auto entries = node.get_leaf_entries();
+        uint32_t next = node.next_leaf();
+        buffer_pool_.unpin_page(current, false);
+
+        for (auto& e : entries) {
+            if (!key_has_prefix(e.key, prefix)) {
+                // Either we haven't reached the prefix range yet (leaf
+                // descent landed early) or we've moved past it entirely
+                // — tell those apart by comparing e.key's own leading
+                // elements against prefix, same technique prefix_scan
+                // uses for its analogous early-landing case.
+                Key e_prefix(e.key.begin(), e.key.begin() + std::min(prefix.size(), e.key.size()));
+                if (e_prefix < prefix) continue;
+                done = true;
+                break;
+            }
+
+            const Value& range_val = e.key[prefix.size()];
+
+            if (lo.has_value()) {
+                if (range_val < *lo) continue;
+                if (!lo_inclusive && range_val == *lo) continue;
+            }
+            if (hi.has_value()) {
+                if (*hi < range_val) { done = true; break; }
+                if (!hi_inclusive && range_val == *hi) { done = true; break; }
+            }
+
+            result.emplace_back(e.key, e.value);
+        }
+
+        current = next;
+    }
+
+    return result;
+}
+
 void BTree::remove(const Key& key) {
     uint32_t transaction_id = wal_.begin();
     remove(transaction_id, key);

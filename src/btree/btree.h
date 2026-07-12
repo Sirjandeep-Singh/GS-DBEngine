@@ -134,6 +134,36 @@ public:
     // exactly prefix_scan({X}).
     std::vector<std::pair<Key, std::vector<uint8_t>>> prefix_scan(const Key& prefix) const;
 
+    // returns every key-value pair whose key begins with `prefix` AND
+    // whose element immediately after `prefix` (the "range column")
+    // satisfies [lo, hi] with the given inclusivity — each bound
+    // optional/independent, but at least one of lo/hi must be set. The
+    // trailing elements after the range column (the primary-key suffix)
+    // are ignored entirely, same as prefix_scan ignores them.
+    //
+    // This is the range-query analogue of prefix_scan, and reuses its
+    // leaf-chain-walk approach — see prefix_scan's comment for why a
+    // plain range_scan(start, end) doesn't work directly on a raw index
+    // key: a raw key is {indexed_value..., primary_key...}, and because
+    // a shorter tuple sorts before any longer tuple sharing its prefix
+    // ({25} < {25, "id7"}), a bare-value lower bound works by accident
+    // but a bare-value upper bound would wrongly exclude every real
+    // entry sharing that value. bounded_scan sidesteps this by comparing
+    // only the single range-column element directly (not the whole
+    // suffix), so both bound directions are exact regardless of what
+    // follows in the key.
+    //
+    // `prefix` may be empty (a plain index used as a pure range scan on
+    // its first column) or a leftmost prefix fixed by equality (e.g.
+    // `dept = 'eng' AND age > 25` on a (dept, age) index passes
+    // prefix = {"eng"}, lo = 25) — real engines apply the same
+    // leftmost-prefix restriction: a range can only be the *last*
+    // condition in the leftmost prefix used.
+    std::vector<std::pair<Key, std::vector<uint8_t>>> bounded_scan(
+        const Key&                  prefix,
+        const std::optional<Value>& lo, bool lo_inclusive,
+        const std::optional<Value>& hi, bool hi_inclusive) const;
+
     // returns all key-value pairs in the tree, in ascending order.
     std::vector<std::pair<Key, std::vector<uint8_t>>> scan_all() const;
 
@@ -156,6 +186,12 @@ private:
 
     // descends from root to the leaf page that should contain `key`
     uint32_t find_leaf_page(const Key& key) const;
+
+    // descends from the root to the leftmost leaf page in the tree —
+    // used by bounded_scan() when it has no lo bound (and an empty
+    // prefix) to start from, mirroring the leftmost-child descent
+    // scan_all() already does.
+    uint32_t find_leftmost_leaf() const;
 
     // descends from root to the leaf page, recording the path of ancestor
     // page_ids visited along the way (root first, leaf last excluded)

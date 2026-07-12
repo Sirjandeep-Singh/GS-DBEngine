@@ -219,6 +219,21 @@ struct CreateIndexStmt {
 };
 
 // ─────────────────────────────────────────────
+// DROP INDEX statement
+// ─────────────────────────────────────────────
+
+// DROP INDEX index_name
+//
+// Mirrors DropTableStmt/DROP TABLE's pattern exactly: removes catalog
+// metadata only (CatalogManager::drop_index()) and leaves the index's
+// B+ tree pages orphaned rather than reclaiming them via the free list —
+// the same pre-existing gap DROP TABLE already has, not something new
+// introduced here.
+struct DropIndexStmt {
+    std::string index_name;
+};
+
+// ─────────────────────────────────────────────
 // CREATE DATABASE / DROP DATABASE / USE / SHOW
 // ─────────────────────────────────────────────
 
@@ -253,6 +268,7 @@ using Statement = std::variant<
     CreateTableStmt,
     DropTableStmt,
     CreateIndexStmt,
+    DropIndexStmt,
     CreateDatabaseStmt,
     DropDatabaseStmt,
     UseStmt,

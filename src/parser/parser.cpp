@@ -74,8 +74,9 @@ Statement Parser::parse_statement() {
     if (check(TokenType::DROP))   {
         advance();
         if (check(TokenType::TABLE))    return parse_drop_table();
+        if (check(TokenType::INDEX))    return parse_drop_index();
         if (check(TokenType::DATABASE)) return parse_drop_database();
-        throw std::runtime_error(error_msg("TABLE or DATABASE after DROP"));
+        throw std::runtime_error(error_msg("TABLE, INDEX, or DATABASE after DROP"));
     }
     if (check(TokenType::CREATE)) {
         advance();
@@ -406,6 +407,17 @@ Statement Parser::parse_create_index() {
     stmt.table_name = expect(TokenType::IDENTIFIER, "CREATE INDEX ON table name").value;
     stmt.column_names = parse_column_list();
 
+    return stmt;
+}
+
+// ─────────────────────────────────────────────
+// DROP INDEX
+// ─────────────────────────────────────────────
+
+Statement Parser::parse_drop_index() {
+    expect(TokenType::INDEX, "DROP INDEX");
+    DropIndexStmt stmt;
+    stmt.index_name = expect(TokenType::IDENTIFIER, "DROP INDEX name").value;
     return stmt;
 }
 

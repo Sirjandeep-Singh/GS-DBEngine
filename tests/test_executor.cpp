@@ -1,8 +1,10 @@
-// g++ -std=c++17 tests/test_executor.cpp src/executor/executor.cpp src/parser/parser.cpp src/parser/tokenizer.cpp src/table/table.cpp src/row/serializer.cpp src/btree/btree.cpp src/btree/btree_node.cpp src/btree/free_list_manager.cpp src/catalog/catalog_manager.cpp src/storage/disk_manager.cpp src/header/header_manager.cpp src/storage/buffer_pool.cpp src/wal/wal_manager.cpp -o tests/test_executor && ./tests/test_executor
+// g++ -std=c++17 tests/test_executor.cpp src/executor/executor.cpp src/parser/parser.cpp src/parser/tokenizer.cpp src/table/table.cpp src/row/serializer.cpp src/btree/btree.cpp src/btree/btree_node.cpp src/btree/free_list_manager.cpp src/btree/key.cpp src/index/index.cpp src/catalog/catalog_manager.cpp src/storage/disk_manager.cpp src/header/header_manager.cpp src/storage/buffer_pool.cpp src/wal/wal_manager.cpp -o tests/test_executor && ./tests/test_executor
 
 #include <iostream>
 #include <cassert>
 #include <filesystem>
+#include <algorithm>
+#include <tuple>
 
 #include "../src/storage/disk_manager.h"
 #include "../src/header/header_manager.h"
@@ -659,6 +661,189 @@ static void seed_people(Env& env) {
     exec(env, "CREATE INDEX idx_score ON people (score);");
 }
 
+// customers 1..10; orders exist only for customers {1, 2, 3, 5}, with
+// amounts spaced out so a correlated range condition (o.amount > X) can
+// narrow within a single customer's orders too. `with_index` controls
+// whether orders.customer_id gets an index — used to check that a
+// correlated subquery returns the SAME rows whether or not G's
+// index-seeding path is actually exercised, proving correctness doesn't
+// depend on it (only performance does).
+static void seed_orders_customers(Env& env, bool with_index) {
+    exec(env, "CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(20));");
+    exec(env, "CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, amount FLOAT);");
+    for (int i = 1; i <= 10; i++) {
+        exec(env, "INSERT INTO customers VALUES (" + std::to_string(i) + ", 'cust" + std::to_string(i) + "');");
+    }
+    // orders: (order_id, customer_id, amount)
+    std::vector<std::tuple<int,int,float>> orders = {
+        {1, 1, 10.0f}, {2, 1, 50.0f},
+        {3, 2, 20.0f},
+        {4, 3, 5.0f},  {5, 3, 60.0f}, {6, 3, 70.0f},
+        {7, 5, 15.0f},
+    };
+    for (auto& [oid, cid, amt] : orders) {
+        exec(env, "INSERT INTO orders VALUES (" + std::to_string(oid) + ", " + std::to_string(cid) +
+                  ", " + std::to_string(amt) + ");");
+    }
+    if (with_index) {
+        exec(env, "CREATE INDEX idx_orders_customer ON orders (customer_id);");
+    }
+}
+
+void test_select_covering_index_returns_correct_projection() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // dept and age are both idx_dept_age columns; id is the primary key.
+    // Every column this query touches (WHERE dept, projected dept/age/id)
+    // is covered by idx_dept_age + the primary key, so this should be
+    // answerable via scan_covering() with no Table::select_by_key() calls.
+    auto r = exec(env, "SELECT id, dept, age FROM people WHERE dept = 'eng';");
+    assert(r.success);
+    assert(r.rows.size() == 10);  // every 5th id, 1..50
+    for (auto& row : r.rows) {
+        int id = std::stoi(row[0]);
+        assert(id % 5 == 0);
+        assert(row[1] == "eng");
+        int age = std::stoi(row[2]);
+        assert(age == 20 + (id % 10));
+    }
+
+    std::cout << "[PASS] SELECT covered entirely by an index returns the correct projection\n";
+    cleanup();
+}
+
+void test_select_covering_index_with_range_and_order_by() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // score is idx_score's only column and also the ORDER BY column, and
+    // id (primary key) is the only other projected column — fully
+    // coverable by idx_score.
+    auto r = exec(env, "SELECT id, score FROM people WHERE score > 45 ORDER BY score ASC;");
+    assert(r.success);
+    assert(r.rows.size() == 5);  // ids 46..50
+    float prev = 0;
+    for (auto& row : r.rows) {
+        float score = std::stof(row[1]);
+        assert(score > prev);
+        prev = score;
+        assert(std::stoi(row[0]) == static_cast<int>(score));
+    }
+
+    std::cout << "[PASS] range-filtered, ORDER BY SELECT covered by an index returns correctly sorted rows\n";
+    cleanup();
+}
+
+void test_select_not_coverable_still_correct_via_fallback() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // score isn't a column of idx_dept (only dept is), so this can't be
+    // covered by that index — must fall back to scan_with_index's
+    // select_by_key() path, and still return the right rows.
+    auto r = exec(env, "SELECT id, dept, score FROM people WHERE dept = 'eng';");
+    assert(r.success);
+    assert(r.rows.size() == 10);
+    for (auto& row : r.rows) {
+        int id = std::stoi(row[0]);
+        assert(id % 5 == 0);
+        assert(row[1] == "eng");
+        assert(std::stof(row[2]) == static_cast<float>(id));
+    }
+
+    std::cout << "[PASS] SELECT not coverable by any index still returns correct rows via fallback\n";
+    cleanup();
+}
+
+void test_correlated_exists_matches_customers_with_orders() {
+    for (bool with_index : {false, true}) {
+        cleanup();
+        Env env;
+        seed_orders_customers(env, with_index);
+
+        auto r = exec(env, "SELECT id FROM customers c WHERE EXISTS "
+                            "(SELECT 1 FROM orders o WHERE o.customer_id = c.id);");
+        assert(r.success);
+        assert(r.rows.size() == 4);  // customers 1, 2, 3, 5
+        std::vector<int> ids;
+        for (auto& row : r.rows) ids.push_back(std::stoi(row[0]));
+        std::sort(ids.begin(), ids.end());
+        assert((ids == std::vector<int>{1, 2, 3, 5}));
+
+        cleanup();
+    }
+    std::cout << "[PASS] correlated EXISTS returns the same customers whether or not the "
+                 "inner table's correlated column is indexed\n";
+}
+
+void test_correlated_not_exists_matches_customers_without_orders() {
+    for (bool with_index : {false, true}) {
+        cleanup();
+        Env env;
+        seed_orders_customers(env, with_index);
+
+        auto r = exec(env, "SELECT id FROM customers c WHERE NOT EXISTS "
+                            "(SELECT 1 FROM orders o WHERE o.customer_id = c.id);");
+        assert(r.success);
+        assert(r.rows.size() == 6);  // customers 4, 6, 7, 8, 9, 10
+        std::vector<int> ids;
+        for (auto& row : r.rows) ids.push_back(std::stoi(row[0]));
+        std::sort(ids.begin(), ids.end());
+        assert((ids == std::vector<int>{4, 6, 7, 8, 9, 10}));
+
+        cleanup();
+    }
+    std::cout << "[PASS] correlated NOT EXISTS returns the same customers whether or not the "
+                 "inner table's correlated column is indexed\n";
+}
+
+void test_correlated_exists_with_additional_range_condition() {
+    for (bool with_index : {false, true}) {
+        cleanup();
+        Env env;
+        seed_orders_customers(env, with_index);
+
+        // customer 3 has an order > 50 (60, 70); customer 1 has an order of
+        // exactly 50 (not > 50); customer 2's only order is 20; customer 5's
+        // only order is 15 — so only customer 3 should match.
+        auto r = exec(env, "SELECT id FROM customers c WHERE EXISTS "
+                            "(SELECT 1 FROM orders o WHERE o.customer_id = c.id AND o.amount > 50);");
+        assert(r.success);
+        assert(r.rows.size() == 1);
+        assert(r.rows[0][0] == "3");
+
+        cleanup();
+    }
+    std::cout << "[PASS] correlated EXISTS combined with a range condition on the inner table is correct\n";
+}
+
+void test_correlated_in_subquery_matches_customers_with_orders() {
+    for (bool with_index : {false, true}) {
+        cleanup();
+        Env env;
+        seed_orders_customers(env, with_index);
+
+        // Non-correlated IN, but exercises the same scan_with_index() path
+        // on the inner table (orders.customer_id) that the correlated
+        // EXISTS tests exercise for a correlated one.
+        auto r = exec(env, "SELECT id FROM customers WHERE id IN "
+                            "(SELECT customer_id FROM orders WHERE amount > 10);");
+        assert(r.success);
+        std::vector<int> ids;
+        for (auto& row : r.rows) ids.push_back(std::stoi(row[0]));
+        std::sort(ids.begin(), ids.end());
+        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+        assert((ids == std::vector<int>{1, 2, 3, 5}));  // orders > 10: cust 1 (50), 2 (20), 3 (60,70), 5 (15)
+
+        cleanup();
+    }
+    std::cout << "[PASS] IN subquery with a range condition on the inner table returns correct customers\n";
+}
+
 void test_select_equality_uses_single_column_index() {
     cleanup();
     Env env;
@@ -734,6 +919,78 @@ void test_select_int_literal_against_float_column_is_coerced() {
     assert(r.rows[0][0] == "7");
 
     std::cout << "[PASS] int literal against a FLOAT indexed column is coerced and matched\n";
+    cleanup();
+}
+
+void test_select_range_uses_single_column_index() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // score is 1.0..50.0 (score = id), idx_score is a single-column index.
+    // score > 40 AND score <= 45 -> ids 41..45.
+    auto r = exec(env, "SELECT id FROM people WHERE score > 40 AND score <= 45;");
+    assert(r.success);
+    assert(r.rows.size() == 5);
+    for (auto& row : r.rows) {
+        int id = std::stoi(row[0]);
+        assert(id >= 41 && id <= 45);
+    }
+
+    std::cout << "[PASS] range WHERE (> and <=) uses a single-column index\n";
+    cleanup();
+}
+
+void test_select_range_scoped_to_composite_prefix() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // idx_dept_age is (dept, age); dept = 'eng' fixes the leftmost column,
+    // age >= 20 AND age <= 22 ranges over the next one. eng rows (every
+    // 5th id) alternate age 25/20 — only the age=20 ones (ids 10,20,30,
+    // 40,50) satisfy the range.
+    auto r = exec(env, "SELECT id FROM people WHERE dept = 'eng' AND age >= 20 AND age <= 22;");
+    assert(r.success);
+    assert(r.rows.size() == 5);
+    for (auto& row : r.rows) {
+        int id = std::stoi(row[0]);
+        assert(id % 10 == 0);  // ids 10,20,30,40,50
+    }
+
+    std::cout << "[PASS] composite-index range stays scoped to the leftmost equality prefix\n";
+    cleanup();
+}
+
+void test_update_with_range_where_uses_index() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    auto r = exec(env, "UPDATE people SET age = 99 WHERE score >= 46;");
+    assert(r.success);
+    assert(r.rows_affected == 5);  // ids 46..50
+
+    auto check = exec(env, "SELECT id FROM people WHERE age = 99;");
+    assert(check.rows.size() == 5);
+
+    std::cout << "[PASS] UPDATE with a range WHERE updates exactly the right rows\n";
+    cleanup();
+}
+
+void test_delete_with_range_where_uses_index() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    auto r = exec(env, "DELETE FROM people WHERE score < 6;");
+    assert(r.success);
+    assert(r.rows_affected == 5);  // ids 1..5
+
+    auto check = exec(env, "SELECT id FROM people;");
+    assert(check.rows.size() == 45);
+
+    std::cout << "[PASS] DELETE with a range WHERE deletes exactly the right rows\n";
     cleanup();
 }
 
@@ -926,6 +1183,21 @@ int main() {
     test_select_composite_index_full_match();
     test_select_index_candidates_still_filtered_by_full_predicate();
     test_select_int_literal_against_float_column_is_coerced();
+    test_select_range_uses_single_column_index();
+    test_select_range_scoped_to_composite_prefix();
+    test_update_with_range_where_uses_index();
+    test_delete_with_range_where_uses_index();
+
+    std::cout << "\n=== Covering Index Read Tests ===\n";
+    test_select_covering_index_returns_correct_projection();
+    test_select_covering_index_with_range_and_order_by();
+    test_select_not_coverable_still_correct_via_fallback();
+
+    std::cout << "\n=== Correlated Subquery Index Tests ===\n";
+    test_correlated_exists_matches_customers_with_orders();
+    test_correlated_not_exists_matches_customers_without_orders();
+    test_correlated_exists_with_additional_range_condition();
+    test_correlated_in_subquery_matches_customers_with_orders();
     test_select_or_clause_not_incorrectly_narrowed();
     test_select_count_aggregate_uses_index();
     test_update_where_indexed_equality();

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <vector>
+#include <optional>
 #include "../catalog/schema.h"
 #include "../btree/btree.h"
 #include "../btree/key.h"
@@ -129,6 +130,40 @@ public:
     // Throws if indexed_value has MORE elements than the index has
     // columns.
     std::vector<Key> find(const Key& indexed_value) const;
+
+    // Returns every primary key indexed under `prefix` (a leftmost
+    // prefix fixed by equality, possibly empty — same rule as find())
+    // whose value in the very next column falls within [lo, hi] (each
+    // bound optional/independent inclusivity), in ascending order —
+    // real engines' rule that a range condition can only be the last
+    // condition in a leftmost prefix, e.g. an index on (dept, age):
+    // `dept = 'eng' AND age > 25` is prefix = {"eng"}, lo = 25;
+    // `age > 25` alone on a single-column age index is prefix = {}.
+    //
+    // At least one of lo/hi must be set — this is the range-lookup
+    // counterpart of find(), not a substitute for it. Throws if
+    // prefix.size() >= this index's column count (no column left to
+    // range over) or if neither lo nor hi is set. Empty (never throws)
+    // if prefix or a bound value contains NULL — NULL is never indexed
+    // and never satisfies a comparison, same convention find()/
+    // is_indexable use.
+    std::vector<Key> find_range(const Key&                  prefix,
+                                 const std::optional<Value>& lo, bool lo_inclusive,
+                                 const std::optional<Value>& hi, bool hi_inclusive) const;
+
+    // Covering-read variants of find()/find_range(): same lookup, but
+    // return the FULL indexed-column tuple alongside each primary key
+    // instead of discarding it. A caller whose SELECT list, ORDER BY, and
+    // WHERE columns all lie within this index's columns ∪ the table's
+    // primary key can build result rows directly from these pairs — no
+    // Table::select_by_key() fetch needed at all (item H, "covering index
+    // reads"). Same preconditions/semantics as find()/find_range()
+    // respectively; see those for details.
+    std::vector<std::pair<Key, Key>> find_with_values(const Key& indexed_value) const;
+    std::vector<std::pair<Key, Key>> find_range_with_values(
+        const Key&                  prefix,
+        const std::optional<Value>& lo, bool lo_inclusive,
+        const std::optional<Value>& hi, bool hi_inclusive) const;
 
     // true if a value tuple is eligible to be indexed at all — false if
     // any element is NULL. Used consistently by insert_entry, the

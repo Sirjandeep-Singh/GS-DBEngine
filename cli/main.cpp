@@ -4,7 +4,7 @@
 //   g++ -std=c++17 cli/main.cpp src/database.cpp src/executor/executor.cpp \
 //       src/parser/parser.cpp src/parser/tokenizer.cpp src/table/table.cpp \
 //       src/row/serializer.cpp src/btree/btree.cpp src/btree/btree_node.cpp \
-//       src/btree/free_list_manager.cpp src/btree/key.cpp \
+//       src/btree/free_list_manager.cpp src/btree/key.cpp src/index/index.cpp \
 //       src/catalog/catalog_manager.cpp src/storage/disk_manager.cpp \
 //       src/header/header_manager.cpp src/storage/buffer_pool.cpp \
 //       src/wal/wal_manager.cpp -Isrc -o tests/gsdb_temp && ./tests/gsdb_temp

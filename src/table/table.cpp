@@ -298,11 +298,15 @@ uint32_t Table::delete_where(const Predicate& predicate) {
 
 uint32_t Table::update_where(const Predicate& predicate,
                               const std::vector<std::pair<size_t, Value>>& new_values) {
-    // phase 1: collect matching keys, their old rows, and their updated
-    // rows, without touching any tree. Validate every UNIQUE index for
-    // every updated row up front — before any of them are written — same
-    // as update() does for a single row.
-    auto all = btree_.scan_all();
+    return update_matched(scan(predicate), new_values);
+}
+
+uint32_t Table::update_matched(const std::vector<ScanResult>& matched_rows,
+                                const std::vector<std::pair<size_t, Value>>& new_values) {
+    // phase 1: build the updated version of every already-matched row,
+    // without touching any tree. Validate every UNIQUE index for every
+    // updated row up front — before any of them are written — same as
+    // update() does for a single row.
     std::vector<std::pair<Key, std::pair<Row, Row>>> to_update;  // key -> (old_row, new_row)
 
     // check_all_unique_constraints() only validates against what's
@@ -317,39 +321,36 @@ uint32_t Table::update_where(const Predicate& predicate,
     // that too. One vector per index, parallel to indexes_.
     std::vector<std::vector<Key>> batch_claimed(indexes_.size());
 
-    for (auto& [key, bytes] : all) {
-        Row old_row = RowSerializer::deserialize(bytes, schema_);
-        if (predicate(old_row)) {
-            Row new_row = old_row;
-            for (auto& [col_idx, new_val] : new_values) {
-                if (is_primary_key_column(schema_, col_idx)) {
-                    throw std::runtime_error(
-                        "Table::update_where: cannot change a primary key column");
-                }
-                new_row.get(col_idx) = new_val;
+    for (const auto& [key, old_row] : matched_rows) {
+        Row new_row = old_row;
+        for (auto& [col_idx, new_val] : new_values) {
+            if (is_primary_key_column(schema_, col_idx)) {
+                throw std::runtime_error(
+                    "Table::update_matched: cannot change a primary key column");
             }
-
-            check_all_unique_constraints(new_row, key);
-
-            for (size_t i = 0; i < indexes_.size(); i++) {
-                const IndexBinding& binding = indexes_[i];
-                if (!binding.index->schema().is_unique) continue;
-
-                Key indexed_value = extract_indexed_value(new_row, binding);
-                if (!Index::is_indexable(indexed_value)) continue;
-
-                for (const Key& claimed : batch_claimed[i]) {
-                    if (claimed == indexed_value) {
-                        throw std::runtime_error(
-                            "Table::update_where: two rows in this update would collide on unique index '" +
-                            binding.index->schema().name + "'");
-                    }
-                }
-                batch_claimed[i].push_back(indexed_value);
-            }
-
-            to_update.emplace_back(key, std::make_pair(std::move(old_row), std::move(new_row)));
+            new_row.get(col_idx) = new_val;
         }
+
+        check_all_unique_constraints(new_row, key);
+
+        for (size_t i = 0; i < indexes_.size(); i++) {
+            const IndexBinding& binding = indexes_[i];
+            if (!binding.index->schema().is_unique) continue;
+
+            Key indexed_value = extract_indexed_value(new_row, binding);
+            if (!Index::is_indexable(indexed_value)) continue;
+
+            for (const Key& claimed : batch_claimed[i]) {
+                if (claimed == indexed_value) {
+                    throw std::runtime_error(
+                        "Table::update_matched: two rows in this update would collide on unique index '" +
+                        binding.index->schema().name + "'");
+                }
+            }
+            batch_claimed[i].push_back(indexed_value);
+        }
+
+        to_update.emplace_back(key, std::make_pair(old_row, std::move(new_row)));
     }
 
     // phase 2: delete old + reinsert new, after scan and validation are

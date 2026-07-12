@@ -384,6 +384,137 @@ void test_range_scan_with_composite_keys_scoped_to_first_column() {
 }
 
 // ─────────────────────────────────────────────
+// bounded_scan — index-style {indexed_value, primary_key} range queries
+// ─────────────────────────────────────────────
+
+void test_bounded_scan_single_column_inclusive_bounds() {
+    cleanup();
+    DiskManager dm(DB_FILE);
+    BufferPool  bp(dm);
+    WALManager  wal(WAL_FILE, bp);
+    HeaderManager hm(bp, wal);
+    hm.init();
+    FreeListManager free_list(bp, wal, hm);
+
+    BTree tree(bp, wal, free_list, INVALID_PAGE);
+
+    // simulate a single-column secondary index: raw key = {value, pk}
+    for (int32_t i = 0; i < 100; i++) {
+        Key key = { Value(i), Value(int32_t(1000 + i)) };  // pk distinct from value
+        tree.insert(key, {});
+    }
+
+    // WHERE value >= 20 AND value <= 30 — inclusive both sides
+    auto result = tree.bounded_scan(Key{}, Value(int32_t(20)), true, Value(int32_t(30)), true);
+    assert(result.size() == 11);  // 20..30 inclusive
+    for (auto& [key, value] : result) {
+        int32_t v = std::get<int32_t>(key[0]);
+        assert(v >= 20 && v <= 30);
+    }
+    assert(std::get<int32_t>(result.front().first[0]) == 20);
+    assert(std::get<int32_t>(result.back().first[0])  == 30);
+
+    std::cout << "[PASS] bounded_scan returns correct inclusive subset on a plain (non-composite) index key\n";
+    cleanup();
+}
+
+void test_bounded_scan_exclusive_bounds() {
+    cleanup();
+    DiskManager dm(DB_FILE);
+    BufferPool  bp(dm);
+    WALManager  wal(WAL_FILE, bp);
+    HeaderManager hm(bp, wal);
+    hm.init();
+    FreeListManager free_list(bp, wal, hm);
+
+    BTree tree(bp, wal, free_list, INVALID_PAGE);
+
+    for (int32_t i = 0; i < 50; i++) {
+        Key key = { Value(i), Value(int32_t(2000 + i)) };
+        tree.insert(key, {});
+    }
+
+    // WHERE value > 10 AND value < 20 — exclusive both sides
+    auto result = tree.bounded_scan(Key{}, Value(int32_t(10)), false, Value(int32_t(20)), false);
+    assert(result.size() == 9);  // 11..19
+    for (auto& [key, value] : result) {
+        int32_t v = std::get<int32_t>(key[0]);
+        assert(v > 10 && v < 20);
+    }
+
+    std::cout << "[PASS] bounded_scan correctly excludes endpoints when inclusivity is false\n";
+    cleanup();
+}
+
+void test_bounded_scan_open_ended_bounds() {
+    cleanup();
+    DiskManager dm(DB_FILE);
+    BufferPool  bp(dm);
+    WALManager  wal(WAL_FILE, bp);
+    HeaderManager hm(bp, wal);
+    hm.init();
+    FreeListManager free_list(bp, wal, hm);
+
+    BTree tree(bp, wal, free_list, INVALID_PAGE);
+
+    for (int32_t i = 0; i < 40; i++) {
+        Key key = { Value(i), Value(int32_t(3000 + i)) };
+        tree.insert(key, {});
+    }
+
+    // WHERE value >= 35 — no upper bound at all
+    auto lower_only = tree.bounded_scan(Key{}, Value(int32_t(35)), true, std::nullopt, false);
+    assert(lower_only.size() == 5);  // 35..39
+    assert(std::get<int32_t>(lower_only.front().first[0]) == 35);
+    assert(std::get<int32_t>(lower_only.back().first[0])  == 39);
+
+    // WHERE value <= 4 — no lower bound at all
+    auto upper_only = tree.bounded_scan(Key{}, std::nullopt, false, Value(int32_t(4)), true);
+    assert(upper_only.size() == 5);  // 0..4
+    assert(std::get<int32_t>(upper_only.front().first[0]) == 0);
+    assert(std::get<int32_t>(upper_only.back().first[0])  == 4);
+
+    std::cout << "[PASS] bounded_scan handles an open-ended lower or upper bound correctly\n";
+    cleanup();
+}
+
+void test_bounded_scan_scoped_to_composite_prefix() {
+    cleanup();
+    DiskManager dm(DB_FILE);
+    BufferPool  bp(dm);
+    WALManager  wal(WAL_FILE, bp);
+    HeaderManager hm(bp, wal);
+    hm.init();
+    FreeListManager free_list(bp, wal, hm);
+
+    BTree tree(bp, wal, free_list, INVALID_PAGE);
+
+    // simulate a composite (dept, age) index: raw key = {dept, age, pk}
+    // dept = 'eng' for even pk, 'sales' for odd — ages 20..29 for each dept
+    for (int32_t pk = 0; pk < 20; pk++) {
+        std::string dept = (pk % 2 == 0) ? "eng" : "sales";
+        int32_t age = 20 + (pk / 2);
+        Key key = { Value(dept), Value(age), Value(pk) };
+        tree.insert(key, {});
+    }
+
+    // WHERE dept = 'eng' AND age >= 22 AND age <= 25
+    Key prefix = { Value(std::string("eng")) };
+    auto result = tree.bounded_scan(prefix, Value(int32_t(22)), true, Value(int32_t(25)), true);
+
+    for (auto& [key, value] : result) {
+        assert(std::get<std::string>(key[0]) == "eng");
+        int32_t age = std::get<int32_t>(key[1]);
+        assert(age >= 22 && age <= 25);
+    }
+    // ages 22,23,24,25 each appear exactly once under dept='eng'
+    assert(result.size() == 4);
+
+    std::cout << "[PASS] bounded_scan scopes a trailing range to one leftmost-prefix group on a composite key\n";
+    cleanup();
+}
+
+// ─────────────────────────────────────────────
 // Splitting (forces multiple levels)
 // ─────────────────────────────────────────────
 
@@ -997,6 +1128,12 @@ int main() {
     test_scan_all_returns_sorted_order();
     test_range_scan_returns_correct_subset();
     test_range_scan_across_leaf_boundaries();
+
+    std::cout << "\n=== BTree bounded_scan (index range query) Tests ===\n";
+    test_bounded_scan_single_column_inclusive_bounds();
+    test_bounded_scan_exclusive_bounds();
+    test_bounded_scan_open_ended_bounds();
+    test_bounded_scan_scoped_to_composite_prefix();
 
     std::cout << "\n=== BTree Basic Deletion Tests ===\n";
     test_remove_single_key();

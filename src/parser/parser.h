@@ -77,6 +77,7 @@ private:
     Statement parse_delete();
     Statement parse_create_table();
     Statement parse_drop_table();
+    Statement parse_drop_index();
     Statement parse_create_index();
     Statement parse_create_database();
     Statement parse_drop_database();

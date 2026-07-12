@@ -120,17 +120,18 @@ void Executor::persist_index_roots(const Table& tbl) const
 // Index-assisted scans — see executor.h for why this exists
 // ─────────────────────────────────────────────────────────────────────────────
 
-void Executor::collect_and_equalities(const WhereExprPtr& expr,
-                                       const TableSchema&  schema,
-                                       const std::string&  alias,
-                                       std::vector<std::pair<std::string, Value>>& out) const
+void Executor::collect_and_constraints(const WhereExprPtr& expr,
+                                        const TableSchema&  schema,
+                                        const std::string&  alias,
+                                        std::unordered_map<std::string, ColumnConstraint>& out,
+                                        const OuterContext* outer) const
 {
     if (!expr) return;
 
     if (expr->kind == WhereExpr::Kind::LOGICAL) {
         if (expr->logical_op == LogicalOp::AND) {
-            collect_and_equalities(expr->left,  schema, alias, out);
-            collect_and_equalities(expr->right, schema, alias, out);
+            collect_and_constraints(expr->left,  schema, alias, out, outer);
+            collect_and_constraints(expr->right, schema, alias, out, outer);
         }
         // OR / NOT: neither side (or the negated subtree) is a condition
         // every matching row must satisfy, so nothing here is safe to use
@@ -138,85 +139,300 @@ void Executor::collect_and_equalities(const WhereExprPtr& expr,
         return;
     }
 
-    // EXISTS carries no column-level equality of its own.
+    // EXISTS carries no column-level equality/range of its own.
     if (expr->kind == WhereExpr::Kind::EXISTS) return;
 
     const CompareExpr& c = expr->compare;
-    if (c.op != CompareOp::EQ)   return;  // only plain equality narrows to a point lookup
-    if (c.operand_column)        return;  // column = column can't seed a literal key
-    if (c.subquery)               return;  // (defensive — EQ never carries a subquery today)
-    if (is_null(c.operand))      return;  // "col = NULL" never matches anything (SQL semantics)
+    bool is_eq    = (c.op == CompareOp::EQ);
+    bool is_range = (c.op == CompareOp::LT || c.op == CompareOp::GT ||
+                      c.op == CompareOp::LTE || c.op == CompareOp::GTE);
+    if (!is_eq && !is_range) return;  // only EQ/LT/GT/LTE/GTE narrow to a point or interval
+
+    if (c.subquery)          return;  // (defensive — EQ/range never carry a subquery today)
+    if (is_null(c.operand) && !c.operand_column) return;  // "col <op> NULL" never matches anything
 
     // Only a reference to THIS table's columns is usable — an unqualified
     // ref always is; a qualified one must match this table's name or alias.
     if (!c.column.table_name.empty() && !table_name_matches(c.column.table_name, schema, alias))
         return;
 
-    out.emplace_back(c.column.column_name, c.operand);
+    Value seed_value;
+    if (c.operand_column) {
+        // column = column: normally unusable (neither side is a literal),
+        // UNLESS the other side resolves against the OUTER row rather
+        // than this table — see this function's header comment (G). Skip
+        // if it resolves locally (an intra-table column comparison, e.g.
+        // `a = b` on the same row, is never a literal seed regardless of
+        // outer) or if it resolves nowhere at all.
+        if (try_resolve_column(*c.operand_column, schema, alias)) return;
+
+        if (!outer) return;
+        std::optional<size_t> outer_idx;
+        if (outer->right_schema) {
+            outer_idx = try_resolve_column(*c.operand_column, *outer->schema, *outer->right_schema,
+                                            outer->alias, outer->right_alias);
+        } else {
+            outer_idx = try_resolve_column(*c.operand_column, *outer->schema, outer->alias);
+        }
+        if (!outer_idx) return;  // doesn't resolve against the outer row either — unusable
+
+        seed_value = outer->row->get(*outer_idx);
+        if (is_null(seed_value)) return;  // "col <op> NULL" never matches anything
+    } else {
+        seed_value = c.operand;
+    }
+
+    ColumnConstraint& cc = out[c.column.column_name];
+    if (is_eq) {
+        cc.eq = seed_value;
+        return;
+    }
+    switch (c.op) {
+        case CompareOp::GT:  cc.lo = seed_value; cc.lo_inclusive = false; break;
+        case CompareOp::GTE: cc.lo = seed_value; cc.lo_inclusive = true;  break;
+        case CompareOp::LT:  cc.hi = seed_value; cc.hi_inclusive = false; break;
+        case CompareOp::LTE: cc.hi = seed_value; cc.hi_inclusive = true;  break;
+        default: break;  // unreachable — is_range already narrowed c.op to these four
+    }
 }
 
-std::optional<std::pair<const IndexSchema*, Key>> Executor::find_index_prefix(
+std::optional<Executor::IndexMatch> Executor::find_index_prefix(
     const WhereExprPtr& where,
     const TableSchema&  schema,
-    const std::string&  alias) const
+    const std::string&  alias,
+    const OuterContext* outer) const
 {
     if (!where) return std::nullopt;
 
-    std::vector<std::pair<std::string, Value>> equalities;
-    collect_and_equalities(where, schema, alias, equalities);
-    if (equalities.empty()) return std::nullopt;
+    std::unordered_map<std::string, ColumnConstraint> constraints;
+    collect_and_constraints(where, schema, alias, constraints, outer);
+    if (constraints.empty()) return std::nullopt;
 
     const IndexSchema* best = nullptr;
-    Key                 best_prefix;
+    IndexMatch          best_match;
+    size_t               best_effective_len = 0;  // prefix columns, +1 if extended by a range
 
     for (const auto& summary : catalog_.get_indexes_for_table(schema.name)) {
-        Key prefix;
+        Key   prefix;
+        bool  extended_by_range = false;
+        std::optional<Value> range_lo, range_hi;
+        bool  range_lo_inclusive = false, range_hi_inclusive = false;
+
         for (const std::string& col_name : summary.column_names) {
-            const Value* found = nullptr;
-            for (const auto& [cname, val] : equalities) {
-                if (cname == col_name) { found = &val; break; }
-            }
-            if (!found) break;  // leftmost prefix stops at the first uncovered column
+            auto it = constraints.find(col_name);
+            if (it == constraints.end()) break;  // leftmost prefix stops at the first uncovered column
 
             int col_idx = schema.column_index(col_name);
             if (col_idx < 0) break;  // shouldn't happen — defensive
-            auto coerced = coerce_equality_value(*found, schema.columns[static_cast<size_t>(col_idx)].type);
-            if (!coerced) break;  // literal can never equal this column's type
+            ColumnType col_type = schema.columns[static_cast<size_t>(col_idx)].type;
 
-            prefix.push_back(std::move(*coerced));
+            if (it->second.eq.has_value()) {
+                auto coerced = coerce_equality_value(*it->second.eq, col_type);
+                if (!coerced) break;  // literal can never equal this column's type
+                prefix.push_back(std::move(*coerced));
+                continue;
+            }
+
+            // No equality on this column — if it has a range, that range
+            // can extend the prefix by exactly one more column (the
+            // leftmost-prefix rule: a range is only usable as the LAST
+            // condition), then we're done regardless of what comes after.
+            if (it->second.lo.has_value() || it->second.hi.has_value()) {
+                if (it->second.lo.has_value()) {
+                    range_lo = coerce_equality_value(*it->second.lo, col_type);
+                    range_lo_inclusive = it->second.lo_inclusive;
+                    if (!range_lo) { range_lo_inclusive = false; }
+                }
+                if (it->second.hi.has_value()) {
+                    range_hi = coerce_equality_value(*it->second.hi, col_type);
+                    range_hi_inclusive = it->second.hi_inclusive;
+                    if (!range_hi) { range_hi_inclusive = false; }
+                }
+                if (range_lo.has_value() || range_hi.has_value()) extended_by_range = true;
+            }
+            break;  // whether or not a usable range was found, no further columns are usable
         }
-        if (prefix.size() > best_prefix.size()) {
-            best_prefix = std::move(prefix);
-            best        = &catalog_.get_index(summary.name);  // stable reference, see open_indexes
+
+        size_t effective_len = prefix.size() + (extended_by_range ? 1 : 0);
+        if (effective_len == 0) continue;
+
+        if (effective_len > best_effective_len) {
+            best_effective_len = effective_len;
+            best               = &catalog_.get_index(summary.name);  // stable reference, see open_indexes
+            best_match.prefix  = std::move(prefix);
+            best_match.range_lo = extended_by_range ? range_lo : std::nullopt;
+            best_match.range_lo_inclusive = extended_by_range ? range_lo_inclusive : false;
+            best_match.range_hi = extended_by_range ? range_hi : std::nullopt;
+            best_match.range_hi_inclusive = extended_by_range ? range_hi_inclusive : false;
         }
     }
 
     if (!best) return std::nullopt;
-    return std::make_pair(best, std::move(best_prefix));
+    best_match.index = best;
+    return best_match;
+}
+
+std::vector<Key> Executor::index_lookup(const Index& idx, const IndexMatch& match)
+{
+    if (match.is_range()) {
+        return idx.find_range(match.prefix,
+                               match.range_lo, match.range_lo_inclusive,
+                               match.range_hi, match.range_hi_inclusive);
+    }
+    return idx.find(match.prefix);
 }
 
 std::vector<ScanResult> Executor::scan_with_index(const Table&         tbl,
                                                     const TableSchema&  schema,
                                                     const WhereExprPtr& where,
                                                     const Predicate&    pred,
-                                                    const std::string&  alias) const
+                                                    const std::string&  alias,
+                                                    const OuterContext* outer) const
 {
-    auto index_match = find_index_prefix(where, schema, alias);
+    auto index_match = find_index_prefix(where, schema, alias, outer);
     if (!index_match) {
         return tbl.scan(pred);
     }
 
-    const IndexSchema& ischema = *index_match->first;
+    const IndexSchema& ischema = *index_match->index;
     Index idx(ischema, schema.primary_key_indices.size(), buffer_pool_, wal_, free_list_);
 
     std::vector<ScanResult> results;
-    for (const Key& pk : idx.find(index_match->second)) {
+    for (const Key& pk : index_lookup(idx, *index_match)) {
         std::optional<Row> row = tbl.select_by_key(pk);
         // Every fetched row is still run through the full predicate — the
-        // index only narrowed candidates by its equality prefix, but the
-        // WHERE clause may have additional conditions beyond it.
+        // index only narrowed candidates by its equality prefix (and
+        // possibly one trailing range column), but the WHERE clause may
+        // have additional conditions beyond it.
         if (row && pred(*row)) {
             results.push_back({pk, std::move(*row)});
+        }
+    }
+    return results;
+}
+
+bool Executor::where_is_coverable(const WhereExprPtr& expr,
+                                   const TableSchema&  schema,
+                                   const std::string&  alias,
+                                   const std::unordered_set<std::string>& covered) const
+{
+    if (!expr) return true;
+
+    // EXISTS and IN/NOT IN-subquery involve a different table's columns
+    // (and their own correctness lives in run_subquery_scan) — bail
+    // conservatively rather than try to prove those safe here too.
+    if (expr->kind == WhereExpr::Kind::EXISTS) return false;
+
+    if (expr->kind == WhereExpr::Kind::LOGICAL) {
+        if (expr->logical_op == LogicalOp::NOT) {
+            return where_is_coverable(expr->left, schema, alias, covered);
+        }
+        // AND and OR both require both sides coverable — even for OR,
+        // evaluate_where still needs to read whichever columns either
+        // side references to decide the row doesn't match.
+        return where_is_coverable(expr->left,  schema, alias, covered) &&
+               where_is_coverable(expr->right, schema, alias, covered);
+    }
+
+    const CompareExpr& c = expr->compare;
+    if (c.subquery) return false;  // IN_SUBQUERY / NOT_IN_SUBQUERY — bail conservatively
+
+    if (!c.column.table_name.empty() && !table_name_matches(c.column.table_name, schema, alias))
+        return false;  // shouldn't normally happen for a single-table query — bail defensively
+    if (!covered.count(c.column.column_name)) return false;
+
+    if (c.operand_column) {
+        // column = column: the other side must ALSO be covered (and be
+        // this same table — a reference to an outer row in a correlated
+        // subquery's own WHERE can't be answered from this table's index
+        // tuple, though it's still a perfectly good index SEED elsewhere;
+        // covering is a stricter question than seeding).
+        if (!c.operand_column->table_name.empty() &&
+            !table_name_matches(c.operand_column->table_name, schema, alias))
+            return false;
+        if (!covered.count(c.operand_column->column_name)) return false;
+    }
+
+    return true;
+}
+
+bool Executor::is_select_coverable(const std::vector<SelectColumn>&  columns,
+                                    const WhereExprPtr&               where,
+                                    const std::vector<OrderByClause>& order_by,
+                                    const TableSchema&                schema,
+                                    const std::string&                alias,
+                                    const std::unordered_set<std::string>& covered) const
+{
+    auto ref_is_covered = [&](const ColumnRef& ref) {
+        if (!ref.table_name.empty() && !table_name_matches(ref.table_name, schema, alias)) return false;
+        return covered.count(ref.column_name) != 0;
+    };
+
+    for (const auto& sc : columns) {
+        if (sc.is_star)                          return false;  // needs every column, not just indexed ones
+        if (sc.is_literal)                        continue;      // reads no column at all
+        if (sc.aggregate != AggregateType::NONE) return false;  // handled by execute_select_aggregate instead
+        if (!ref_is_covered(sc.column)) return false;
+    }
+    for (const auto& ob : order_by) {
+        if (!ref_is_covered(ob.column)) return false;
+    }
+    return where_is_coverable(where, schema, alias, covered);
+}
+
+std::optional<std::vector<ScanResult>> Executor::scan_covering(
+    const TableSchema&                 schema,
+    const WhereExprPtr&                where,
+    const Predicate&                   pred,
+    const std::vector<SelectColumn>&   columns,
+    const std::vector<OrderByClause>&  order_by,
+    const std::string&                 alias) const
+{
+    auto index_match = find_index_prefix(where, schema, alias);
+    if (!index_match) return std::nullopt;
+
+    const IndexSchema& ischema = *index_match->index;
+
+    std::unordered_set<std::string> covered(ischema.column_names.begin(), ischema.column_names.end());
+    for (uint32_t pk_idx : schema.primary_key_indices) {
+        covered.insert(schema.columns[pk_idx].name);
+    }
+
+    if (!is_select_coverable(columns, where, order_by, schema, alias, covered)) {
+        return std::nullopt;
+    }
+
+    Index idx(ischema, schema.primary_key_indices.size(), buffer_pool_, wal_, free_list_);
+
+    std::vector<std::pair<Key, Key>> entries;
+    if (index_match->is_range()) {
+        entries = idx.find_range_with_values(index_match->prefix,
+                                              index_match->range_lo, index_match->range_lo_inclusive,
+                                              index_match->range_hi, index_match->range_hi_inclusive);
+    } else {
+        entries = idx.find_with_values(index_match->prefix);
+    }
+
+    std::vector<ScanResult> results;
+    results.reserve(entries.size());
+    for (auto& [index_key, pk] : entries) {
+        // Every OTHER column stays default-constructed (monostate/NULL) —
+        // is_select_coverable() already proved this query's WHERE/SELECT/
+        // ORDER BY never reads them, so leaving them unpopulated is safe
+        // for this query specifically, even though the resulting Row
+        // would NOT be a valid full row for any other purpose.
+        Row row;
+        row.values.resize(schema.columns.size());
+        for (size_t i = 0; i < ischema.column_names.size(); i++) {
+            int col_idx = schema.column_index(ischema.column_names[i]);
+            if (col_idx >= 0) row.values[static_cast<size_t>(col_idx)] = index_key[i];
+        }
+        for (size_t i = 0; i < schema.primary_key_indices.size(); i++) {
+            row.values[schema.primary_key_indices[i]] = pk[i];
+        }
+
+        if (pred(row)) {
+            results.push_back({pk, std::move(row)});
         }
     }
     return results;
@@ -245,6 +461,8 @@ QueryResult Executor::execute(const Statement& stmt)
                 return execute_drop_table(s);
             if constexpr (std::is_same_v<T, CreateIndexStmt>)
                 return execute_create_index(s);
+            if constexpr (std::is_same_v<T, DropIndexStmt>)
+                return execute_drop_index(s);
             if constexpr (std::is_same_v<T, ShowStmt>)
                 return execute_show(s);
             if constexpr (std::is_same_v<T, CreateDatabaseStmt>)
@@ -391,6 +609,25 @@ QueryResult Executor::execute_drop_table(const DropTableStmt& stmt)
         return {false, "Table '" + stmt.table_name + "' does not exist"};
     }
     catalog_.drop_table(stmt.table_name);
+    return {true, "", {}, {}, 0};
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DROP INDEX
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Mirrors execute_drop_table exactly: removes catalog metadata only. The
+// index's B+ tree pages are left orphaned rather than reclaimed via the
+// free list — same pre-existing gap DROP TABLE already has (see
+// CatalogManager::drop_table), not something new introduced here.
+QueryResult Executor::execute_drop_index(const DropIndexStmt& stmt)
+{
+    try {
+        catalog_.get_index(stmt.index_name);
+    } catch (const std::exception&) {
+        return {false, "Index '" + stmt.index_name + "' does not exist"};
+    }
+    catalog_.drop_index(stmt.index_name);
     return {true, "", {}, {}, 0};
 }
 
@@ -635,8 +872,21 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
     if (stmt.joins.empty()) {
         // ── Simple (no JOIN) path ─────────────────────────────────────────────
         Predicate pred = build_predicate(stmt.where, schema, nullptr, nullptr, stmt.table_alias);
-        std::vector<ScanResult> rows =
-            scan_with_index(left_tbl, schema, stmt.where, pred, stmt.table_alias);
+
+        // scan_covering() (H) answers the query straight from an index's
+        // own tuple + primary key when every column this query touches is
+        // covered by it — skipping the Table::select_by_key() fetch
+        // scan_with_index() would otherwise do per candidate. Falls back
+        // to scan_with_index() whenever it isn't applicable (no matching
+        // index, SELECT *, or any WHERE/SELECT/ORDER BY column outside
+        // what the index covers) — see scan_covering's own comment.
+        std::vector<ScanResult> rows;
+        if (auto covering = scan_covering(schema, stmt.where, pred, stmt.columns, stmt.order_by,
+                                           stmt.table_alias)) {
+            rows = std::move(*covering);
+        } else {
+            rows = scan_with_index(left_tbl, schema, stmt.where, pred, stmt.table_alias);
+        }
 
         // ORDER BY (only first clause honoured — no secondary sort key)
         if (!stmt.order_by.empty()) {
@@ -855,11 +1105,18 @@ QueryResult Executor::execute_update(const UpdateStmt& stmt)
     Table     tbl(schema, buffer_pool_, wal_, free_list_, index_ptrs(owned_indexes));
     Predicate pred = build_predicate(stmt.where, schema);
 
+    // Computed once and reused for both CHECK validation below and the
+    // mutation itself — index-narrowed via scan_with_index() (falls back
+    // to a full Table::scan() when no index fits), re-checked against the
+    // full predicate already inside scan_with_index(), so every row here
+    // is a genuine match regardless of how it was found.
+    std::vector<ScanResult> matched = scan_with_index(tbl, schema, stmt.where, pred);
+
     // Validate CHECK constraints against every row's post-update values
     // *before* touching storage — a single violation aborts the whole
     // UPDATE with no rows changed, matching CHECK's statement-level atomicity.
     if (!schema.checks.empty()) {
-        for (const auto& match : scan_with_index(tbl, schema, stmt.where, pred)) {
+        for (const auto& match : matched) {
             Row candidate = match.row;
             for (const auto& [idx, val] : new_values) {
                 candidate.values[idx] = val;
@@ -875,20 +1132,19 @@ QueryResult Executor::execute_update(const UpdateStmt& stmt)
         }
     }
 
-    // The mutation itself deliberately still goes through Table::update_where
-    // (a full internal scan) rather than an index-narrowed key loop here:
-    // update_where's phase 1 validates every matched row's UNIQUE indexes
-    // against every OTHER row in the same batch (batch_claimed) before phase
-    // 2 writes any of them — so two rows in one UPDATE colliding on a new
-    // unique value is caught atomically, with nothing written. Driving the
-    // mutation from Executor with one tbl.update() call per matched key would
-    // lose that: each call commits immediately, so an interior collision
-    // would leave earlier rows already changed. The CHECK-constraint scan
-    // above is already index-narrowed (scan_with_index) — that's the
-    // expensive part when a large table has CHECK constraints; the WHERE
-    // re-scan update_where does internally afterward is comparatively cheap
-    // since it does no per-row validation logic beyond what's already here.
-    uint32_t count = tbl.update_where(pred, new_values);
+    // The mutation itself goes through Table::update_matched(), seeded
+    // from the same index-narrowed `matched` list gathered above — see
+    // Table::update_matched's own comment for why this is safe: its
+    // phase 1 still validates every matched row's UNIQUE indexes against
+    // every OTHER row in the same batch (batch_claimed) before phase 2
+    // writes any of them, so a multi-row UPDATE stays atomic on a
+    // uniqueness collision exactly as before, regardless of whether
+    // `matched` came from a full scan or an index. This also means the
+    // WHERE clause is no longer re-scanned a second time internally —
+    // update_matched() trusts `matched` (already predicate-checked by
+    // scan_with_index() above) instead of re-deriving it from
+    // btree_.scan_all().
+    uint32_t count = tbl.update_matched(matched, new_values);
 
     if (tbl.root_page() != schema.root_page) {
         catalog_.update_table_root(stmt.table_name, tbl.root_page());
@@ -918,14 +1174,14 @@ QueryResult Executor::execute_delete(const DeleteStmt& stmt)
         // narrows candidates — see find_index_prefix), then delete each
         // matched row directly. This is exactly what Table::delete_where does
         // internally — collect matches, then delete each in its own
-        // transaction — just seeded from Index::find() instead of a full
-        // Table::scan(). Unlike UPDATE, DELETE has no cross-row validation to
-        // preserve (no UNIQUE-index batch collision is possible from
-        // removing rows), so there's no atomicity difference from the
-        // scan-based path below.
-        const IndexSchema& ischema = *index_match->first;
+        // transaction — just seeded from Index::find()/find_range() instead
+        // of a full Table::scan(). Unlike UPDATE, DELETE has no cross-row
+        // validation to preserve (no UNIQUE-index batch collision is
+        // possible from removing rows), so there's no atomicity difference
+        // from the scan-based path below.
+        const IndexSchema& ischema = *index_match->index;
         Index idx(ischema, schema.primary_key_indices.size(), buffer_pool_, wal_, free_list_);
-        for (const Key& pk : idx.find(index_match->second)) {
+        for (const Key& pk : index_lookup(idx, *index_match)) {
             std::optional<Row> row = tbl.select_by_key(pk);
             if (row && pred(*row)) {
                 tbl.delete_row(pk);
@@ -1282,7 +1538,18 @@ std::vector<ScanResult> Executor::run_subquery_scan(const SelectStmt&    subquer
     // correlation depth works the same way one level deep does).
     Predicate pred = build_predicate(subquery.where, sub_schema, nullptr, outer,
                                       subquery.table_alias);
-    std::vector<ScanResult> rows = sub_tbl.scan(pred);
+
+    // scan_with_index() (rather than a plain sub_tbl.scan(pred)) is what
+    // makes a correlated subquery an index nested-loop join (G): 'outer'
+    // is forwarded all the way down into collect_and_constraints, so a
+    // correlated equality/range like `o.customer_id = c.id` can seed
+    // orders' customer_id index with c.id's actual value for whichever
+    // outer row is currently being checked, instead of falling back to a
+    // full scan of `orders` per outer row. Non-correlated subqueries
+    // (outer == nullptr) benefit the same way from any literal WHERE
+    // condition, same as a top-level SELECT would.
+    std::vector<ScanResult> rows =
+        scan_with_index(sub_tbl, sub_schema, subquery.where, pred, subquery.table_alias, outer);
 
     if (subquery.limit.has_value()) {
         size_t lim = static_cast<size_t>(subquery.limit.value());

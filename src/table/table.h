@@ -137,6 +137,24 @@ public:
     uint32_t update_where(const Predicate& predicate,
                           const std::vector<std::pair<size_t, Value>>& new_values);
 
+    // Same operation as update_where(), but seeded from a caller-supplied
+    // list of already-matched rows instead of a fresh btree_.scan_all() —
+    // e.g. Executor::scan_with_index()'s index-narrowed candidates, so an
+    // indexed UPDATE doesn't pay for a full table scan just to re-find
+    // rows it already located. Every other guarantee is identical: phase
+    // 1 validates every matched row's UNIQUE indexes against every OTHER
+    // row in the same batch (batch_claimed) before phase 2 writes any of
+    // them, so a multi-row UPDATE stays atomic on a uniqueness collision
+    // regardless of how `matched_rows` was produced.
+    //
+    // `matched_rows` is trusted as-is — it is the caller's job to ensure
+    // every row in it actually satisfies the intended WHERE clause (an
+    // index only narrows candidates; Executor re-checks the full
+    // predicate before including a row here). Passing rows that don't
+    // belong will update rows a caller didn't mean to touch.
+    uint32_t update_matched(const std::vector<ScanResult>& matched_rows,
+                             const std::vector<std::pair<size_t, Value>>& new_values);
+
 private:
     const TableSchema& schema_;
     BTree              btree_;

@@ -213,6 +213,162 @@ void test_composite_index_prefix_lookup() {
 }
 
 // ─────────────────────────────────────────────
+// find_range — range queries via a single/composite index
+// ─────────────────────────────────────────────
+
+void test_find_range_single_column_inclusive_and_exclusive() {
+    cleanup();
+    Rig rig;
+
+    IndexSchema schema;
+    schema.name         = "idx_age";
+    schema.table_name   = "people";
+    schema.column_names = {"age"};
+    schema.root_page    = INVALID_PAGE;
+    schema.is_unique    = false;
+
+    Index idx(schema, /*pk_arity=*/1, rig.bp, rig.wal, rig.fl);
+    for (int32_t age = 0; age < 60; age++) {
+        idx.insert_entry(K(age), K(1000 + age));
+    }
+
+    // age >= 20 AND age <= 25 — inclusive both sides
+    auto incl = idx.find_range(Key{}, Value(int32_t(20)), true, Value(int32_t(25)), true);
+    assert(incl.size() == 6);
+
+    // age > 20 AND age < 25 — exclusive both sides
+    auto excl = idx.find_range(Key{}, Value(int32_t(20)), false, Value(int32_t(25)), false);
+    assert(excl.size() == 4);
+
+    // age >= 55, no upper bound
+    auto lower_only = idx.find_range(Key{}, Value(int32_t(55)), true, std::nullopt, false);
+    assert(lower_only.size() == 5);
+
+    std::cout << "[PASS] find_range returns correct rows for inclusive/exclusive/open-ended single-column bounds\n";
+    cleanup();
+}
+
+void test_find_range_scoped_to_composite_prefix() {
+    cleanup();
+    Rig rig;
+
+    IndexSchema schema;
+    schema.name         = "idx_dept_age";
+    schema.table_name   = "people";
+    schema.column_names = {"dept", "age"};
+    schema.root_page    = INVALID_PAGE;
+    schema.is_unique    = false;
+
+    Index idx(schema, /*pk_arity=*/1, rig.bp, rig.wal, rig.fl);
+    for (int32_t pk = 0; pk < 20; pk++) {
+        Key val = { pk % 2 == 0 ? VS("eng") : VS("sales"), Value(int32_t(20 + pk / 2)) };
+        idx.insert_entry(val, K(pk));
+    }
+
+    // dept = 'eng' AND age >= 22 AND age <= 25 — range only within the
+    // leftmost prefix fixed by the dept equality, never crossing into
+    // the 'sales' group even though ages overlap between groups.
+    auto result = idx.find_range(Key{VS("eng")}, Value(int32_t(22)), true, Value(int32_t(25)), true);
+    assert(result.size() == 4);
+
+    std::cout << "[PASS] find_range on a composite index stays scoped to the leftmost-prefix group\n";
+    cleanup();
+}
+
+void test_find_range_throws_without_any_bound() {
+    cleanup();
+    Rig rig;
+
+    IndexSchema schema;
+    schema.name         = "idx_age2";
+    schema.table_name   = "people";
+    schema.column_names = {"age"};
+    schema.root_page    = INVALID_PAGE;
+    schema.is_unique    = false;
+
+    Index idx(schema, /*pk_arity=*/1, rig.bp, rig.wal, rig.fl);
+
+    bool threw = false;
+    try {
+        idx.find_range(Key{}, std::nullopt, false, std::nullopt, false);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    assert(threw);
+
+    std::cout << "[PASS] find_range throws when neither lo nor hi is provided\n";
+    cleanup();
+}
+
+// ─────────────────────────────────────────────
+// find_with_values / find_range_with_values — covering-read primitives (H)
+// ─────────────────────────────────────────────
+
+void test_find_with_values_returns_indexed_columns_alongside_pk() {
+    cleanup();
+    Rig rig;
+
+    IndexSchema schema;
+    schema.name         = "idx_dept_age";
+    schema.table_name   = "people";
+    schema.column_names = {"dept", "age"};
+    schema.root_page    = INVALID_PAGE;
+    schema.is_unique    = false;
+
+    Index idx(schema, /*pk_arity=*/1, rig.bp, rig.wal, rig.fl);
+    idx.insert_entry(Key{VS("eng"), Value(int32_t(30))}, K(1));
+    idx.insert_entry(Key{VS("eng"), Value(int32_t(25))}, K(2));
+    idx.insert_entry(Key{VS("sales"), Value(int32_t(40))}, K(3));
+
+    // find({"eng"}) should return both eng rows, each with its FULL
+    // (dept, age) tuple attached — not just the primary key find() alone
+    // would return.
+    auto result = idx.find_with_values(Key{VS("eng")});
+    assert(result.size() == 2);
+    for (auto& [indexed_cols, pk] : result) {
+        assert(indexed_cols.size() == 2);
+        assert(std::get<std::string>(indexed_cols[0]) == "eng");
+        int32_t age = std::get<int32_t>(indexed_cols[1]);
+        assert(age == 25 || age == 30);
+        int32_t pk_val = std::get<int32_t>(pk[0]);
+        assert((age == 30 && pk_val == 1) || (age == 25 && pk_val == 2));
+    }
+
+    std::cout << "[PASS] find_with_values returns the full indexed-column tuple alongside each primary key\n";
+    cleanup();
+}
+
+void test_find_range_with_values_returns_indexed_columns_alongside_pk() {
+    cleanup();
+    Rig rig;
+
+    IndexSchema schema;
+    schema.name         = "idx_age3";
+    schema.table_name   = "people";
+    schema.column_names = {"age"};
+    schema.root_page    = INVALID_PAGE;
+    schema.is_unique    = false;
+
+    Index idx(schema, /*pk_arity=*/1, rig.bp, rig.wal, rig.fl);
+    for (int32_t age = 0; age < 20; age++) {
+        idx.insert_entry(K(age), K(100 + age));
+    }
+
+    auto result = idx.find_range_with_values(Key{}, Value(int32_t(5)), true, Value(int32_t(8)), true);
+    assert(result.size() == 4);  // ages 5,6,7,8
+    for (auto& [indexed_cols, pk] : result) {
+        assert(indexed_cols.size() == 1);
+        int32_t age = std::get<int32_t>(indexed_cols[0]);
+        assert(age >= 5 && age <= 8);
+        int32_t pk_val = std::get<int32_t>(pk[0]);
+        assert(pk_val == 100 + age);
+    }
+
+    std::cout << "[PASS] find_range_with_values returns the full indexed-column tuple alongside each primary key\n";
+    cleanup();
+}
+
+// ─────────────────────────────────────────────
 // NULL handling
 // ─────────────────────────────────────────────
 
@@ -314,6 +470,11 @@ int main() {
     test_unique_index_rejects_duplicate_value();
     test_unique_index_allows_reinsert_of_same_pk();
     test_composite_index_prefix_lookup();
+    test_find_range_single_column_inclusive_and_exclusive();
+    test_find_range_scoped_to_composite_prefix();
+    test_find_range_throws_without_any_bound();
+    test_find_with_values_returns_indexed_columns_alongside_pk();
+    test_find_range_with_values_returns_indexed_columns_alongside_pk();
     test_null_indexed_value_is_never_indexed();
     test_remove_entry_removes_exactly_one_row();
     test_transaction_threaded_insert_spans_multiple_indexes();

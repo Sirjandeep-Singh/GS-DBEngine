@@ -51,6 +51,14 @@ public:
     QueryResult execute(const Statement& stmt);
 
 private:
+    // Forward declaration — OuterContext is fully defined further down
+    // (see the "Subqueries" section), but find_index_prefix() and friends
+    // need to accept a pointer to it up here for G's correlated-subquery
+    // index seeding (see collect_and_constraints's comment). A pointer to
+    // an incomplete type is fine; only the later, complete definition is
+    // ever dereferenced.
+    struct OuterContext;
+
     CatalogManager&   catalog_;
     BufferPool&       buffer_pool_;
     WALManager&       wal_;
@@ -99,32 +107,101 @@ private:
     // — so a wrong or partial index match can only make this path slower
     // than it needs to be, never wrong.
 
-    // Walks a WHERE tree and collects every top-level AND-conjoined equality
-    // comparison (column = literal) it can find, as (column_name, value)
-    // pairs. Descends through LOGICAL AND nodes only — an OR or NOT node
-    // contributes nothing from its subtree, since neither side of an OR is a
-    // condition every matching row must satisfy, and NOT's semantics aren't a
-    // simple equality either. This makes the collected list always a set of
-    // *necessary* (if not sufficient) conditions on any matching row, which
-    // is exactly what's safe to use as an index seed.
-    void collect_and_equalities(const WhereExprPtr& expr,
-                                 const TableSchema&  schema,
-                                 const std::string&  alias,
-                                 std::vector<std::pair<std::string, Value>>& out) const;
+    // Per-column constraints collected out of a WHERE tree's top-level AND
+    // conjuncts: an equality pins the column to one value; lo/hi narrow it
+    // to a range (each independently optional, with its own inclusivity).
+    // A column can carry an equality OR a range, never both in the same
+    // struct instance at once in practice (an EQ makes any range on the
+    // same column redundant for index-seeding purposes), but nothing here
+    // enforces that — find_index_prefix() only ever reads .eq when walking
+    // an index's leftmost columns, and only reads lo/hi for the first
+    // column that has no .eq, so a stray range alongside an eq is simply
+    // never consulted, not incorrect.
+    //
+    // Collection deliberately does NOT try to pick the *tightest* bound
+    // when a column has more than one LT/GT/etc. condition on it (e.g.
+    // `age > 20 AND age > 25`) — it just keeps the last one seen. This is
+    // safe, never wrong: scan_with_index()/execute_delete() still re-run
+    // the full predicate against every fetched row, so a looser seed bound
+    // only costs a few extra candidate fetches, never a wrong result.
+    struct ColumnConstraint {
+        std::optional<Value> eq;
+        std::optional<Value> lo;
+        bool                  lo_inclusive = false;
+        std::optional<Value> hi;
+        bool                  hi_inclusive = false;
+    };
+
+    // Walks a WHERE tree and collects every top-level AND-conjoined
+    // equality (column = literal) and range (column </<=/>/>= literal)
+    // comparison it can find, keyed by column name. Descends through
+    // LOGICAL AND nodes only — an OR or NOT node contributes nothing from
+    // its subtree, since neither side of an OR is a condition every
+    // matching row must satisfy, and NOT's semantics aren't a simple
+    // equality/range either. This makes the collected map always a set of
+    // *necessary* (if not sufficient) conditions on any matching row,
+    // which is exactly what's safe to use as an index seed.
+    //
+    // `outer`, when non-null, enables G — seeding an index from a
+    // correlated column-to-column comparison (e.g. `o.customer_id = c.id`
+    // inside `WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id =
+    // c.id)`): a comparison with operand_column set is normally skipped
+    // entirely (neither side is a literal), but if the operand_column
+    // resolves against the OUTER row instead of this table, its value for
+    // *this specific outer row* is a real literal as far as this table's
+    // index is concerned — look it up via outer->row and treat it exactly
+    // like a literal EQ/range operand. This turns a correlated EXISTS/IN
+    // into an index nested-loop join: for the outer row currently being
+    // checked, "o.customer_id = c.id" seeds orders' customer_id index with
+    // c.id's actual value from `outer`.
+    void collect_and_constraints(const WhereExprPtr& expr,
+                                  const TableSchema&  schema,
+                                  const std::string&  alias,
+                                  std::unordered_map<std::string, ColumnConstraint>& out,
+                                  const OuterContext* outer = nullptr) const;
+
+    // A usable index pick from find_index_prefix(): `prefix` is the
+    // leftmost run of equality-matched columns (in the index's own column
+    // order, ready for Index::find()/find_range()'s prefix parameter);
+    // range_lo/range_hi (with their inclusivity flags) are set only when
+    // the column immediately after `prefix` was narrowed by a range
+    // instead of (or in addition to reaching) an equality — i.e. exactly
+    // when is_range() is true, this is a find_range() call instead of a
+    // find() call.
+    struct IndexMatch {
+        const IndexSchema*   index = nullptr;
+        Key                   prefix;
+        std::optional<Value> range_lo;
+        bool                  range_lo_inclusive = false;
+        std::optional<Value> range_hi;
+        bool                  range_hi_inclusive = false;
+
+        bool is_range() const { return range_lo.has_value() || range_hi.has_value(); }
+    };
 
     // Picks the best usable index for `where` against `schema`, if any: the
-    // one whose column_names has the longest leftmost prefix fully covered by
-    // collect_and_equalities()'s output (each value coerced to the matching
-    // column's type — e.g. an int literal against a FLOAT column — so a
-    // usable index isn't missed purely over a literal's parsed type; ties
-    // broken by catalog order). Returns {index schema, prefix key} on a
-    // match (prefix key in the index's own column order, ready for
-    // Index::find()), or nullopt if no index has even a 1-column prefix
-    // match — the caller falls back to Table::scan().
-    std::optional<std::pair<const IndexSchema*, Key>> find_index_prefix(
+    // one whose column_names has the longest leftmost prefix fully covered
+    // by collect_and_constraints()'s output — each equality value coerced
+    // to the matching column's type (e.g. an int literal against a FLOAT
+    // column), so a usable index isn't missed purely over a literal's
+    // parsed type — optionally followed by a range on the very next
+    // column (same coercion applied to lo/hi); ties broken by catalog
+    // order, longer effective prefix (equality columns, plus one more if
+    // a range extends it) wins. Returns nullopt if no index has even a
+    // 1-column equality or range match — the caller falls back to
+    // Table::scan().
+    std::optional<IndexMatch> find_index_prefix(
         const WhereExprPtr& where,
         const TableSchema&  schema,
-        const std::string&  alias = "") const;
+        const std::string&  alias = "",
+        const OuterContext* outer = nullptr) const;
+
+    // Looks up candidate primary keys for `match` against `idx` — find()
+    // for a plain equality prefix, find_range() when the match extends
+    // one column further via a range. Shared by scan_with_index() and
+    // execute_delete()'s index-assisted path so the find()-vs-find_range()
+    // dispatch lives in exactly one place.
+    static std::vector<Key> index_lookup(const Index& idx, const IndexMatch& match);
 
     // Returns the rows matching `pred`, using find_index_prefix()'s pick (if
     // any) to fetch only candidate primary keys via Index::find() +
@@ -138,7 +215,61 @@ private:
                                              const TableSchema&  schema,
                                              const WhereExprPtr& where,
                                              const Predicate&    pred,
-                                             const std::string&  alias = "") const;
+                                             const std::string&  alias = "",
+                                             const OuterContext* outer = nullptr) const;
+
+    // ── Covering index reads (H) ─────────────────────────────────────────────
+    //
+    // A query is "coverable" by a given index when every column it touches
+    // — SELECT list, ORDER BY, and every column referenced anywhere in
+    // WHERE — lies within that index's own columns union the table's
+    // primary key. When that holds, the index tuple returned alongside
+    // each primary key (see Index::find_with_values/find_range_with_values)
+    // already contains every value the query could possibly need, so the
+    // usual extra Table::select_by_key() fetch per candidate is pure
+    // waste — scan_covering() skips it entirely.
+    //
+    // where_is_coverable() walks the WHERE tree and bails conservatively
+    // (returns false) on anything fiddly to prove safe here: EXISTS or an
+    // IN/NOT IN subquery (a different table's columns are involved, and
+    // subquery correctness lives in run_subquery_scan, not this fast
+    // path), or a column=column comparison where the other side isn't
+    // itself covered.
+    bool where_is_coverable(const WhereExprPtr& expr,
+                             const TableSchema&  schema,
+                             const std::string&  alias,
+                             const std::unordered_set<std::string>& covered) const;
+
+    // Full coverability check: WHERE (via where_is_coverable) plus every
+    // plain SELECT column and the ORDER BY column (if any). SELECT * and
+    // any aggregate column make a query trivially non-coverable (a star
+    // needs every column in the table, not just the indexed ones; an
+    // aggregate is handled by execute_select_aggregate, a different path
+    // entirely) — literal SELECT items (e.g. `SELECT 1`) are always free,
+    // since they don't read any column at all.
+    bool is_select_coverable(const std::vector<SelectColumn>&  columns,
+                              const WhereExprPtr&               where,
+                              const std::vector<OrderByClause>& order_by,
+                              const TableSchema&                schema,
+                              const std::string&                alias,
+                              const std::unordered_set<std::string>& covered) const;
+
+    // Attempts a covering-index read for a simple (non-JOIN, non-aggregate)
+    // SELECT: returns nullopt if no index applies at all (same as
+    // find_index_prefix) or the query isn't coverable by whichever index
+    // find_index_prefix picked — the caller should fall back to
+    // scan_with_index() in either case. When it does return, every row in
+    // the result was built directly from the index tuple + primary key,
+    // with every OTHER column in the Row left default-constructed
+    // (monostate/NULL) — safe only because is_select_coverable() already
+    // proved this query's WHERE/SELECT/ORDER BY never touches them.
+    std::optional<std::vector<ScanResult>> scan_covering(
+        const TableSchema&                 schema,
+        const WhereExprPtr&                where,
+        const Predicate&                   pred,
+        const std::vector<SelectColumn>&   columns,
+        const std::vector<OrderByClause>&  order_by,
+        const std::string&                 alias = "") const;
 
     // ── Statement handlers ───────────────────────────────────────────────────
 
@@ -156,6 +287,7 @@ private:
     QueryResult execute_create_table(const CreateTableStmt& stmt);
     QueryResult execute_drop_table(const DropTableStmt& stmt);
     QueryResult execute_create_index(const CreateIndexStmt& stmt);
+    QueryResult execute_drop_index(const DropIndexStmt& stmt);
     QueryResult execute_show(const ShowStmt& stmt);
 
     // These are handled by the Database class — return an error if reached.
