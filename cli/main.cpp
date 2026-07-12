@@ -1,5 +1,5 @@
 // cli/main.cpp — GS-DBEngine interactive REPL
-//
+
 // Compile (from project root, until CMakeLists.txt is written):
 //   g++ -std=c++17 cli/main.cpp src/database.cpp src/executor/executor.cpp \
 //       src/parser/parser.cpp src/parser/tokenizer.cpp src/table/table.cpp \
