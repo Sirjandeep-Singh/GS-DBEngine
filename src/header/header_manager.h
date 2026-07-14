@@ -11,7 +11,7 @@
 // when writing directly to disk with memcpy.
 //
 // Layout in page 0 (byte offsets):
-//   0  - 15  : magic string ("MYDB_V1\0")
+//   0  - 15  : magic string ("MYDB_V2\0")
 //   16 - 19  : page_size
 //   20 - 23  : total_pages
 //   24 - 27  : schema_root_page
@@ -19,8 +19,8 @@
 //   32 - 35  : version
 //   36 - 39  : reserved (padding for future use)
 // Total: 40 bytes — fits easily inside a 4096 byte page.
-static const char     DB_MAGIC[16]        = "MYDB_V1";
-static const uint32_t DB_VERSION          = 1;
+static const char     DB_MAGIC[16]        = "MYDB_V2";
+static const uint32_t DB_VERSION          = 2;
 static const uint32_t NO_FREE_PAGE        = 0xFFFFFFFF;  // sentinel: free list is empty
 
 #pragma pack(push, 1)   // disable struct padding — we need exact byte layout on disk

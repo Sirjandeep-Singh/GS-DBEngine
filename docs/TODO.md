@@ -13,3 +13,4 @@
 - [ ] inquire if database calls checkpoint after a while automatically to regulate log size.
 - [ ] GROUP BY, HAVING, AGGREGATE FUNCTION
 - [ ] MAYBE A QUERY PLANNER
+- [ ] better underflow

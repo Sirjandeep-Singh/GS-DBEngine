@@ -203,7 +203,7 @@ int main()
     const bool interactive = isatty(fileno(stdin));
 
     if (interactive) {
-        std::cout << "GS-DBEngine v0.1\n"
+        std::cout << "GS-DBEngine v2\n"
                   << "Type SQL statements terminated with ';'.\n"
                   << "Type 'exit' or 'quit' to leave.\n"
                   << "Type '\\path' to see/change the data directory.\n"
