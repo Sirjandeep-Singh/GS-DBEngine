@@ -230,40 +230,6 @@ struct ForeignKeyDef {
     std::string               ref_table;   // parent table name
     std::vector<std::string>  ref_columns; // parent's referenced columns, same order/arity
     ForeignKeyOnDelete         on_delete = ForeignKeyOnDelete::RESTRICT;
-
-    // column-level `REFERENCES parent_table(parent_column)` shorthand —
-    // e.g. `customer_id INT REFERENCES customers(id)`. Empty string means
-    // no inline FK on this column. Always ON DELETE RESTRICT — there's no
-    // way to spell ON DELETE CASCADE inline; use the table-level FOREIGN
-    // KEY (...) clause (fk_table_name below) for that.
-    std::string fk_ref_table;
-    std::string fk_ref_column;
-};
-
-// ON DELETE behavior for a FOREIGN KEY constraint when a referenced parent
-// row is deleted (or updated in a way that changes the referenced column
-// values). RESTRICT is the default and the only option for a column-level
-// inline REFERENCES. There is deliberately no CASCADE-on-UPDATE distinct
-// from CASCADE-on-DELETE — Executor always treats an UPDATE that changes a
-// referenced column the same as RESTRICT, regardless of this setting; see
-// Executor::execute_update's FK handling for why.
-//
-// Named distinctly from catalog/schema.h's FkOnDelete (not just reused)
-// because this header and schema.h both end up included together in
-// executor.cpp — two enums of the same name in the same translation unit
-// would collide even though they live in different files.
-enum class ForeignKeyOnDelete {
-    RESTRICT = 1,
-    CASCADE  = 2,
-};
-
-// A table-level FOREIGN KEY (col1, ...) REFERENCES parent (col1, ...)
-// [ON DELETE CASCADE | ON DELETE RESTRICT] clause.
-struct ForeignKeyDef {
-    std::vector<std::string> columns;      // this table's FK columns, in order
-    std::string               ref_table;   // parent table name
-    std::vector<std::string>  ref_columns; // parent's referenced columns, same order/arity
-    ForeignKeyOnDelete         on_delete = ForeignKeyOnDelete::RESTRICT;
 };
 
 struct CreateTableStmt {
@@ -276,17 +242,6 @@ struct CreateTableStmt {
     // via is_primary_key). Mutually exclusive with an inline PRIMARY KEY —
     // Executor rejects CREATE TABLE statements that specify both.
     std::vector<std::string> table_primary_key;
-    // table-level UNIQUE (col1, col2, ...) clauses — one entry per clause,
-    // each naming the columns of one composite UNIQUE constraint. Distinct
-    // from a column-level UNIQUE (ColumnDef::is_unique), which only ever
-    // covers that single column. Multiple table-level UNIQUE clauses are
-    // allowed, same as multiple CHECK clauses.
-    std::vector<std::vector<std::string>> table_unique;
-    // table-level FOREIGN KEY (...) REFERENCES ... clauses. Column-level
-    // inline REFERENCES (ColumnDef::fk_ref_table) are folded into this
-    // same list by Executor::execute_create_table before validation, so
-    // downstream FK handling only ever has to look in one place.
-    std::vector<ForeignKeyDef> foreign_keys;
     // table-level UNIQUE (col1, col2, ...) clauses — one entry per clause,
     // each naming the columns of one composite UNIQUE constraint. Distinct
     // from a column-level UNIQUE (ColumnDef::is_unique), which only ever
