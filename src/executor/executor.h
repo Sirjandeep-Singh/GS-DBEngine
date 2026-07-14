@@ -490,6 +490,58 @@ private:
     // Validates type, VARCHAR length, and that AUTO_INCREMENT is INT only.
     Column column_def_to_column(const ColumnDef& def) const;
 
+    // ── FOREIGN KEY constraint helpers ───────────────────────────────────────
+
+    // Checks `row` (about to be written into `schema`, a child table) against
+    // every FK constraint on `schema`. Returns "" if all pass, or a
+    // human-readable description of the first violation found. A FK whose
+    // component value(s) are NULL (any one, for a composite FK) is skipped
+    // entirely for this row — MATCH SIMPLE semantics, the same convention
+    // Index::is_indexable already uses. Otherwise looks up the referenced
+    // value via the constraint's ref_index_name (or Table::select_by_key on
+    // ref_table's primary key when ref_index_name is empty) — an indexed
+    // lookup, not a scan.
+    std::string check_foreign_keys_on_write(const TableSchema& schema, const Row& row) const;
+
+    // One child table's rows that reference a specific parent row via one
+    // of its FOREIGN KEY constraints.
+    struct ReferencingChildren {
+        std::string           child_table;
+        ForeignKeyConstraint  constraint;   // which FK on child_table matched
+        std::vector<Key>      child_primary_keys;
+    };
+
+    // Finds every child row across every table that references `ref_row`
+    // (a row of `ref_schema`, the parent side) through some other table's
+    // FOREIGN KEY — used before DELETE/UPDATE on a row that might be a
+    // referenced parent. One entry per FK constraint that has at least one
+    // match; a constraint with zero matching child rows is omitted. Looked
+    // up via each constraint's auto-created child_index_name — an indexed
+    // lookup per referencing table, not a full scan of the database. A FK
+    // whose referenced column value(s) are NULL in ref_row can never have
+    // been matched by any child (NULL is never indexed), so it's skipped.
+    std::vector<ReferencingChildren> find_referencing_children(
+        const TableSchema& ref_schema, const Row& ref_row) const;
+
+    // Deletes exactly one row, first checking every FOREIGN KEY constraint
+    // that references it (via find_referencing_children): a RESTRICT
+    // constraint with any matching child row throws (caught by execute()'s
+    // top-level try/catch, same as any other FK violation) instead of
+    // deleting anything; a CASCADE constraint recursively deletes every
+    // matching child row FIRST — so a chain of CASCADE FKs cascades
+    // transitively through this same function, table by table. Returns
+    // false (no-op, not an error) if the row was already gone — e.g.
+    // removed a moment earlier by an overlapping cascade from a different
+    // top-level match in the same DELETE statement — true if it deleted it.
+    //
+    // Re-reads `table_name`'s schema fresh from the catalog on every call
+    // (rather than being handed one) and opens its own Table, since a
+    // cascade can hop to a completely different table with its own schema
+    // and indexes — there is no single long-lived Table this recursion can
+    // share across tables the way execute_insert/update/delete's top-level
+    // handlers share one Table for their own single-table operation.
+    bool delete_row_cascading(const std::string& table_name, const Key& key);
+
     // ── CHECK constraint helpers ─────────────────────────────────────────────
 
     // "Compiles" a parsed CHECK expression (column-level or table-level) into

@@ -12,6 +12,7 @@ enum class TokenType {
     IS, LIKE, ORDER, BY, ASC, DESC,
     LIMIT, JOIN, INNER, LEFT, RIGHT, ON,
     PRIMARY, KEY, AUTO_INCREMENT, CHECK, COUNT, IN, EXISTS,
+    FOREIGN, REFERENCES, CASCADE, RESTRICT,
     INT_KW, FLOAT_KW, BOOLEAN_KW, VARCHAR_KW,  // type keywords
     TRUE_KW, FALSE_KW,                           // boolean literals as keywords
 

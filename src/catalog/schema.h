@@ -84,6 +84,52 @@ struct CheckConstraint {
     Value    operand;
 };
 
+// ON DELETE behavior for a FOREIGN KEY constraint — see the parser's
+// FkOnDelete (ast.h) for the full explanation; this is the catalog's flat,
+// serializable copy of the same two values, kept as its own enum (not a
+// #include of ast.h) for the same reason CheckConstraint doesn't reuse the
+// parser's CompareOp: this layer must not depend on the parser at all.
+enum class FkOnDelete : uint8_t {
+    RESTRICT = 1,
+    CASCADE  = 2,
+};
+
+// A single FOREIGN KEY constraint: this table's column(s) at column_indices
+// must, for every non-NULL row, match some row in ref_table's
+// ref_column_indices. Like CheckConstraint, this is a flat, POD-like,
+// serializable representation — NOT a parser AST node — for the same
+// round-trip-to-disk reason.
+//
+// ref_column_indices must name either ref_table's primary key or an
+// existing UNIQUE constraint on ref_table (validated once, at CREATE TABLE
+// time, in Executor::execute_create_table) — this is what makes the
+// parent-side existence check a single indexed lookup instead of a scan.
+//
+// Enforcement needs an efficient way to go the other direction too — given
+// a parent key, find every child row referencing it (for a parent-side
+// DELETE/UPDATE) — so Executor::execute_create_table also auto-creates a
+// plain (non-unique) secondary Index over column_indices on THIS table,
+// the same way a UNIQUE constraint auto-creates a unique one. Its name is
+// stored here as child_index_name so enforcement code never has to
+// reconstruct or guess it.
+struct ForeignKeyConstraint {
+    std::vector<uint32_t> column_indices;      // this table's FK columns
+    std::string           ref_table;           // parent table name
+    std::vector<uint32_t> ref_column_indices;  // parent's referenced columns, same order/arity
+    FkOnDelete             on_delete = FkOnDelete::RESTRICT;
+    std::string            child_index_name;   // auto-created non-unique index on column_indices
+
+    // Which parent-side index a value lookup uses, resolved once at CREATE
+    // TABLE time instead of re-searched on every INSERT/UPDATE:
+    //   ""    — ref_column_indices IS ref_table's primary key; look up via
+    //           Table::select_by_key() on ref_table (no secondary Index —
+    //           the primary B+ tree itself is the "index").
+    //   other — the name of the existing UNIQUE IndexSchema on ref_table
+    //           whose column_names (in that exact declared order) equal
+    //           ref_column_indices; look up via Index::find().
+    std::string            ref_index_name;
+};
+
 // describes a complete table — its name, columns, and where its data lives
 struct TableSchema {
     std::string              name;           // table name
@@ -96,6 +142,7 @@ struct TableSchema {
     // indices, in this order — see Table::extract_primary_key.
     std::vector<uint32_t>    primary_key_indices;
     std::vector<CheckConstraint> checks;     // CHECK constraints, all implicitly ANDed together
+    std::vector<ForeignKeyConstraint> foreign_keys;  // FOREIGN KEY constraints on this table
 
     // returns the column index for a given column name, or -1 if not found
     int column_index(const std::string& col_name) const {

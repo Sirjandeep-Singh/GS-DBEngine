@@ -326,7 +326,7 @@ void test_update_nonexistent_key_throws() {
     cleanup();
 }
 
-void test_update_primary_key_throws() {
+void test_update_primary_key_moves_row() {
     cleanup();
     Env env;
     TableSchema schema = make_users_schema();
@@ -334,15 +334,66 @@ void test_update_primary_key_throws() {
 
     table.insert(make_user(1, "Alice", 25, true));
 
+    table.update(pk(1), {{0, Value(int32_t(99))}});  // col 0 = primary key
+
+    // the old key is gone
+    assert(!table.select_by_key(pk(1)).has_value());
+
+    // the row now lives at the new key, with every other column intact
+    auto moved = table.select_by_key(pk(99));
+    assert(moved.has_value());
+    assert(get_string(moved->get(1)) == "Alice");
+    assert(get_int(moved->get(2))    == 25);
+    assert(get_bool(moved->get(3))   == true);
+
+    std::cout << "[PASS] update moves a row to its new primary key\n";
+    cleanup();
+}
+
+void test_update_primary_key_collision_throws() {
+    cleanup();
+    Env env;
+    TableSchema schema = make_users_schema();
+    Table table(schema, env.bp, env.wal, env.fl);
+
+    table.insert(make_user(1, "Alice", 25, true));
+    table.insert(make_user(2, "Bob",   30, false));
+
     bool threw = false;
     try {
-        table.update(pk(1), {{0, Value(int32_t(99))}});  // col 0 = primary key
+        table.update(pk(1), {{0, Value(int32_t(2))}});  // 2 already belongs to Bob
     } catch (const std::runtime_error&) {
         threw = true;
     }
     assert(threw);
 
-    std::cout << "[PASS] update throws when attempting to change primary key\n";
+    // neither row should have moved — the throw happens before any write
+    assert(table.select_by_key(pk(1)).has_value());
+    auto bob = table.select_by_key(pk(2));
+    assert(bob.has_value());
+    assert(get_string(bob->get(1)) == "Bob");  // still Bob, not overwritten by Alice
+
+    std::cout << "[PASS] update throws when the new primary key already belongs to a different row\n";
+    cleanup();
+}
+
+void test_update_primary_key_to_same_value_is_a_noop_collision_check() {
+    cleanup();
+    Env env;
+    TableSchema schema = make_users_schema();
+    Table table(schema, env.bp, env.wal, env.fl);
+
+    table.insert(make_user(1, "Alice", 25, true));
+
+    // "changing" the primary key to its own current value must not be
+    // rejected as a collision with itself
+    table.update(pk(1), {{0, Value(int32_t(1))}, {2, Value(int32_t(26))}});
+
+    auto result = table.select_by_key(pk(1));
+    assert(result.has_value());
+    assert(get_int(result->get(2)) == 26);
+
+    std::cout << "[PASS] update to the primary key's own current value is not treated as a collision\n";
     cleanup();
 }
 
@@ -516,7 +567,9 @@ int main() {
     test_update_single_column();
     test_update_multiple_columns();
     test_update_nonexistent_key_throws();
-    test_update_primary_key_throws();
+    test_update_primary_key_moves_row();
+    test_update_primary_key_collision_throws();
+    test_update_primary_key_to_same_value_is_a_noop_collision_check();
 
     std::cout << "\n=== DELETE Tests ===\n";
     test_delete_row();

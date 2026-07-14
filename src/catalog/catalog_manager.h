@@ -57,6 +57,14 @@ public:
     // returns all indexes for a given table
     std::vector<IndexSchema> get_indexes_for_table(const std::string& table_name) const;
 
+    // returns every FOREIGN KEY constraint, across every table, whose
+    // ref_table is `parent_table` — as (child_table_name, constraint)
+    // pairs. Used for parent-side enforcement (DELETE/UPDATE on the
+    // referenced table) and to block DROP TABLE on a table something
+    // else still references. O(number of tables); fine at catalog scale.
+    std::vector<std::pair<std::string, ForeignKeyConstraint>>
+    get_foreign_keys_referencing(const std::string& parent_table) const;
+
     // updates the root_page of a table's B+ tree — called when B+ tree root changes
     void update_table_root(const std::string& table_name, uint32_t new_root_page);
 
