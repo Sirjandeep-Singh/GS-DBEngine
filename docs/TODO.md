@@ -9,6 +9,7 @@
 - [ ] vcpkg/Conan packaging — only worth it if demonstrating package-manager distribution specifically
 - [ ] Quantitative comparison
 - [ ] Review ALL
+- [ ] Review ALL
 - [ ] inquire if database calls checkpoint after a while automatically to regulate log size.
 - [ ] GROUP BY, HAVING, AGGREGATE FUNCTION
 - [ ] MAYBE A QUERY PLANNER

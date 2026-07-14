@@ -36,3 +36,5 @@ INSERT INTO countries VALUES ('USA', 'United States');
 
 -- 3) composite PRIMARY KEY — expected to fail to parse
 CREATE TABLE order_items (order_id INT, product_id INT, qty INT, PRIMARY KEY (order_id, product_id));
+
+DROP DATABASE smoke4;
