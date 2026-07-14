@@ -176,15 +176,6 @@ Key Table::insert(Row row) {
 // SELECT
 // ─────────────────────────────────────────────
 
-namespace {
-bool is_primary_key_column(const TableSchema& schema, size_t col_idx) {
-    for (uint32_t pk_idx : schema.primary_key_indices) {
-        if (pk_idx == col_idx) return true;
-    }
-    return false;
-}
-}
-
 std::optional<Row> Table::select_by_key(const Key& key) const {
     auto bytes = btree_.search(key);
     if (!bytes.has_value()) return std::nullopt;
@@ -220,12 +211,11 @@ void Table::update(const Key& primary_key,
     Row old_row = RowSerializer::deserialize(*bytes, schema_);
     Row new_row = old_row;
 
-    // apply new values to the copy
+    // apply new values to the copy — a primary key column is allowed to be
+    // among them now; extract_primary_key() below (which also throws on a
+    // NULL PK column, same as insert() requires) is what actually moves
+    // the row.
     for (auto& [col_idx, new_val] : new_values) {
-        if (is_primary_key_column(schema_, col_idx)) {
-            throw std::runtime_error(
-                "Table::update: cannot change a primary key column");
-        }
         if (col_idx >= schema_.columns.size()) {
             throw std::runtime_error(
                 "Table::update: column index out of range " + std::to_string(col_idx));
@@ -233,21 +223,44 @@ void Table::update(const Key& primary_key,
         new_row.get(col_idx) = new_val;
     }
 
+    Key new_primary_key = extract_primary_key(new_row);
+    bool pk_changed = (new_primary_key != primary_key);
+
+    // Only relevant when the key is actually changing — updating a row to
+    // its own current key trivially "already exists" (it's the same row)
+    // and must not be rejected.
+    if (pk_changed && btree_.search(new_primary_key).has_value()) {
+        throw std::runtime_error("Table::update: new primary key value already exists");
+    }
+
     // validate every UNIQUE index against the NEW row before writing
-    // anything. check_unique() naturally allows a row to "update to its
-    // own current value" — an existing entry under the new value with
-    // this same primary_key is not treated as a violation — so this is
-    // safe to run before the old entry has even been removed yet.
+    // anything. Deliberately passed the OLD primary_key, not the new one:
+    // at this point the old row's index entries are still on disk (nothing
+    // has been removed yet), so the OLD key is what correctly lets an
+    // unchanged UNIQUE column recognize its own not-yet-removed entry as
+    // "self" rather than a conflict — check_unique() naturally allows a
+    // row to "update to its own current value" this way. This reasoning
+    // holds regardless of whether the primary key itself is also changing.
     check_all_unique_constraints(new_row, primary_key);
 
     auto new_bytes = RowSerializer::serialize(new_row, schema_);
 
-    // delete old blob + old index entries, reinsert new blob + new index
-    // entries, all under one transaction.
+    // delete old blob + old index entries (at the OLD key), reinsert new
+    // blob + new index entries (at the NEW key — identical to the old one
+    // when the primary key isn't changing), all under one transaction.
     uint32_t transaction_id = wal_.begin();
     remove_row_and_indexes(transaction_id, primary_key, old_row);
-    write_row_and_indexes(transaction_id, primary_key, new_row, new_bytes);
+    write_row_and_indexes(transaction_id, new_primary_key, new_row, new_bytes);
     wal_.commit(transaction_id);
+
+    // if the primary key moved into new territory, advance auto-increment
+    // past it — same reasoning as insert()'s equivalent step.
+    if (pk_changed && is_single_int_auto_increment(schema_)) {
+        uint32_t key_val = static_cast<uint32_t>(get_int(new_primary_key.at(0)));
+        if (key_val >= next_auto_increment_) {
+            next_auto_increment_ = key_val + 1;
+        }
+    }
 }
 
 // ─────────────────────────────────────────────
@@ -303,11 +316,18 @@ uint32_t Table::update_where(const Predicate& predicate,
 
 uint32_t Table::update_matched(const std::vector<ScanResult>& matched_rows,
                                 const std::vector<std::pair<size_t, Value>>& new_values) {
-    // phase 1: build the updated version of every already-matched row,
-    // without touching any tree. Validate every UNIQUE index for every
-    // updated row up front — before any of them are written — same as
-    // update() does for a single row.
-    std::vector<std::pair<Key, std::pair<Row, Row>>> to_update;  // key -> (old_row, new_row)
+    // phase 1: build the updated version of every already-matched row and
+    // its new primary key, without touching any tree. Validate every
+    // UNIQUE index for every updated row up front — before any of them are
+    // written — same as update() does for a single row.
+    struct PlannedUpdate {
+        Key old_key;
+        Key new_key;
+        Row old_row;
+        Row new_row;
+    };
+    std::vector<PlannedUpdate> to_update;
+    to_update.reserve(matched_rows.size());
 
     // check_all_unique_constraints() only validates against what's
     // currently on disk — it has no way to know about OTHER rows in this
@@ -324,13 +344,16 @@ uint32_t Table::update_matched(const std::vector<ScanResult>& matched_rows,
     for (const auto& [key, old_row] : matched_rows) {
         Row new_row = old_row;
         for (auto& [col_idx, new_val] : new_values) {
-            if (is_primary_key_column(schema_, col_idx)) {
-                throw std::runtime_error(
-                    "Table::update_matched: cannot change a primary key column");
-            }
             new_row.get(col_idx) = new_val;
         }
 
+        // A primary key column is allowed among new_values now — throws
+        // if it ended up NULL, same as insert()/update() require.
+        Key new_key = extract_primary_key(new_row);
+
+        // See update()'s equivalent comment: deliberately checked against
+        // the OLD key, since the old row's index entries are still on
+        // disk at this point in the batch (nothing has been written yet).
         check_all_unique_constraints(new_row, key);
 
         for (size_t i = 0; i < indexes_.size(); i++) {
@@ -350,20 +373,65 @@ uint32_t Table::update_matched(const std::vector<ScanResult>& matched_rows,
             batch_claimed[i].push_back(indexed_value);
         }
 
-        to_update.emplace_back(key, std::make_pair(old_row, std::move(new_row)));
+        to_update.push_back({key, std::move(new_key), old_row, std::move(new_row)});
+    }
+
+    // phase 1b: primary key collision checks, now that every row's new key
+    // is known.
+    //   - against a row already on disk that ISN'T part of this batch (or
+    //     is, but hasn't vacated its old key here — see below): rejected.
+    //   - against another row's NEW key within this same batch (two rows
+    //     landing on the same key): always rejected.
+    // A collision against another batch row's OLD key (that row moving
+    // elsewhere too — e.g. a same-statement key swap A:1->2, B:2->1) is
+    // ALSO rejected here, even though the end state would be conflict-free
+    // once fully applied: resolving it correctly would require reordering
+    // this whole batch's removes before any of its writes (instead of one
+    // remove+write transaction per row), widening the crash-recovery
+    // window from "one row" to "the whole statement". Not attempted —
+    // split such an UPDATE into separate statements instead (see
+    // update_matched's header comment).
+    std::vector<Key> final_keys;
+    final_keys.reserve(to_update.size());
+    for (const auto& u : to_update) {
+        if (u.new_key != u.old_key && btree_.search(u.new_key).has_value()) {
+            throw std::runtime_error(
+                "Table::update_matched: new primary key value already exists "
+                "(if this is a same-statement key swap or chain, split it into separate UPDATEs)");
+        }
+        for (const Key& seen : final_keys) {
+            if (seen == u.new_key) {
+                throw std::runtime_error(
+                    "Table::update_matched: two rows in this update would collide on the primary key");
+            }
+        }
+        final_keys.push_back(u.new_key);
     }
 
     // phase 2: delete old + reinsert new, after scan and validation are
     // complete — one transaction per row, covering that row's
-    // primary-key write and every index's write together.
-    for (auto& [key, rows] : to_update) {
-        auto& [old_row, new_row] = rows;
-        auto new_bytes = RowSerializer::serialize(new_row, schema_);
+    // primary-key write and every index's write together. When a row's
+    // primary key isn't changing, new_key == old_key and this behaves
+    // exactly as before (remove then reinsert at the same key).
+    for (const auto& u : to_update) {
+        auto new_bytes = RowSerializer::serialize(u.new_row, schema_);
 
         uint32_t transaction_id = wal_.begin();
-        remove_row_and_indexes(transaction_id, key, old_row);
-        write_row_and_indexes(transaction_id, key, new_row, new_bytes);
+        remove_row_and_indexes(transaction_id, u.old_key, u.old_row);
+        write_row_and_indexes(transaction_id, u.new_key, u.new_row, new_bytes);
         wal_.commit(transaction_id);
+    }
+
+    // advance auto-increment past any row that moved into new territory —
+    // same reasoning as insert()'s equivalent step.
+    if (is_single_int_auto_increment(schema_)) {
+        for (const auto& u : to_update) {
+            if (u.new_key == u.old_key) continue;
+            uint32_t key_val = static_cast<uint32_t>(get_int(u.new_key.at(0)));
+            if (key_val >= next_auto_increment_) {
+                next_auto_increment_ = key_val + 1;
+            }
+        }
     }
 
     return static_cast<uint32_t>(to_update.size());

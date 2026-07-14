@@ -113,9 +113,15 @@ public:
 
     // updates the row with the given primary key by applying `new_values`.
     // new_values is a map of column_index -> new Value.
-    // implemented as delete + reinsert to handle variable-size rows correctly.
+    // implemented as delete + reinsert to handle variable-size rows correctly
+    // — including when new_values changes a primary key column, which now
+    // moves the row to its new position in the B+ tree (still one delete +
+    // one reinsert, just at two different keys instead of the same one).
     // throws if the primary key does not exist.
-    // throws if new_values attempts to change a primary key column.
+    // throws if a primary key column ends up NULL.
+    // throws if the resulting primary key already belongs to a DIFFERENT
+    // row (only relevant when a primary key column is actually changing —
+    // updating a row to its own current key is always fine).
     // throws if the resulting row violates a UNIQUE index on this table —
     // checked, like insert(), before any page is written.
     void update(const Key& key, const std::vector<std::pair<size_t, Value>>& new_values);
@@ -146,6 +152,16 @@ public:
     // row in the same batch (batch_claimed) before phase 2 writes any of
     // them, so a multi-row UPDATE stays atomic on a uniqueness collision
     // regardless of how `matched_rows` was produced.
+    //
+    // Like update(), a primary key column may be among new_values — each
+    // affected row moves to its new key. Also like update(), throws if a
+    // resulting primary key already belongs to a DIFFERENT row — including
+    // when that different row is itself another row IN this same batch:
+    // supporting a same-statement key swap or chain (row A moving into
+    // row B's about-to-vacate slot) would require reordering every row's
+    // remove before every row's write, widening the crash-recovery window
+    // from "one row" to "the whole statement" — not attempted. Split such
+    // an UPDATE into separate statements instead.
     //
     // `matched_rows` is trusted as-is — it is the caller's job to ensure
     // every row in it actually satisfies the intended WHERE clause (an

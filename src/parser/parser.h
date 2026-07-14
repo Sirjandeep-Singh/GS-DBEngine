@@ -110,8 +110,13 @@ private:
     // parses a column list: (col1, col2, ...) — used in INSERT and SELECT
     std::vector<std::string> parse_column_list();
 
-    // parses a value list: (val1, val2, ...) — used in INSERT VALUES
-    std::vector<Value>       parse_value_list();
+    // parses a value list: (val1, val2, ...) — used in INSERT VALUES.
+    // A slot may be the literal keyword DEFAULT instead of a value; when
+    // that happens a placeholder (NULL) is stored in the returned vector
+    // and, if is_default is non-null, true is appended to *is_default at
+    // that position (false for ordinary values). Callers that don't care
+    // about DEFAULT slots can pass nullptr.
+    std::vector<Value>       parse_value_list(std::vector<bool>* is_default = nullptr);
 
     // parses a single value: integer, float, string, TRUE, FALSE, NULL
     Value parse_value();
