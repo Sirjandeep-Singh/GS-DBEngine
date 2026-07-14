@@ -356,6 +356,36 @@ Statement Parser::parse_create_table() {
                 }
             }
             stmt.foreign_keys.push_back(std::move(fk));
+        } else if (check(TokenType::UNIQUE)) {
+            // table-level constraint: UNIQUE (col1, col2, ...) — the only way
+            // to declare a composite UNIQUE constraint; inline column-level
+            // UNIQUE only ever names one column. Mirrors the PRIMARY KEY (...)
+            // clause immediately above.
+            advance();  // consume UNIQUE
+            stmt.table_unique.push_back(parse_column_list());
+        } else if (check(TokenType::FOREIGN)) {
+            // table-level constraint: FOREIGN KEY (col1, ...) REFERENCES
+            // parent (col1, ...) [ON DELETE CASCADE | ON DELETE RESTRICT].
+            // The only way to declare a composite FK, and the only way to
+            // spell ON DELETE CASCADE at all — the column-level inline
+            // REFERENCES shorthand below is always ON DELETE RESTRICT.
+            advance();  // consume FOREIGN
+            expect(TokenType::KEY, "FOREIGN KEY");
+            ForeignKeyDef fk;
+            fk.columns = parse_column_list();
+            expect(TokenType::REFERENCES, "FOREIGN KEY (...) REFERENCES");
+            fk.ref_table = expect(TokenType::IDENTIFIER, "REFERENCES table name").value;
+            fk.ref_columns = parse_column_list();
+            if (match(TokenType::ON)) {
+                expect(TokenType::DELETE, "ON DELETE");
+                if (match(TokenType::CASCADE)) {
+                    fk.on_delete = ForeignKeyOnDelete::CASCADE;
+                } else {
+                    expect(TokenType::RESTRICT, "ON DELETE CASCADE|RESTRICT");
+                    fk.on_delete = ForeignKeyOnDelete::RESTRICT;
+                }
+            }
+            stmt.foreign_keys.push_back(std::move(fk));
         } else {
             stmt.columns.push_back(parse_column_def());
         }
@@ -412,6 +442,13 @@ ColumnDef Parser::parse_column_def() {
             expect(TokenType::LPAREN, "CHECK (...)");
             def.check = parse_or_expr();
             expect(TokenType::RPAREN, "CHECK (...)");
+        } else if (match(TokenType::REFERENCES)) {
+            // column-level shorthand: col_name TYPE REFERENCES parent(col) —
+            // always ON DELETE RESTRICT (see ColumnDef::fk_ref_table).
+            def.fk_ref_table = expect(TokenType::IDENTIFIER, "REFERENCES table name").value;
+            expect(TokenType::LPAREN, "REFERENCES parent(column)");
+            def.fk_ref_column = expect(TokenType::IDENTIFIER, "REFERENCES column name").value;
+            expect(TokenType::RPAREN, "REFERENCES parent(column)");
         } else if (match(TokenType::REFERENCES)) {
             // column-level shorthand: col_name TYPE REFERENCES parent(col) —
             // always ON DELETE RESTRICT (see ColumnDef::fk_ref_table).
