@@ -232,6 +232,11 @@ TokenType Tokenizer::keyword_or_identifier(const std::string& word) {
     if (upper == "COUNT")          return TokenType::COUNT;
     if (upper == "IN")             return TokenType::IN;
     if (upper == "EXISTS")         return TokenType::EXISTS;
+    if (upper == "DEFAULT")        return TokenType::DEFAULT;
+    if (upper == "FOREIGN")        return TokenType::FOREIGN;
+    if (upper == "REFERENCES")     return TokenType::REFERENCES;
+    if (upper == "CASCADE")        return TokenType::CASCADE;
+    if (upper == "RESTRICT")       return TokenType::RESTRICT;
     if (upper == "INT")            return TokenType::INT_KW;
     if (upper == "FLOAT")          return TokenType::FLOAT_KW;
     if (upper == "BOOLEAN")        return TokenType::BOOLEAN_KW;
@@ -286,6 +291,11 @@ std::string token_type_name(TokenType type) {
         case TokenType::COUNT:           return "COUNT";
         case TokenType::IN:              return "IN";
         case TokenType::EXISTS:          return "EXISTS";
+        case TokenType::DEFAULT:         return "DEFAULT";
+        case TokenType::FOREIGN:         return "FOREIGN";
+        case TokenType::REFERENCES:      return "REFERENCES";
+        case TokenType::CASCADE:         return "CASCADE";
+        case TokenType::RESTRICT:        return "RESTRICT";
         case TokenType::INT_KW:          return "INT";
         case TokenType::FLOAT_KW:        return "FLOAT";
         case TokenType::BOOLEAN_KW:      return "BOOLEAN";

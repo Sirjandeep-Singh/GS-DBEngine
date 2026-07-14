@@ -288,6 +288,60 @@ void test_catalog_persists_across_restart() {
     cleanup();
 }
 
+void test_catalog_persists_column_default() {
+    cleanup();
+    {
+        DiskManager    dm(DB_FILE);
+        dm.allocate_page();  // page 0 — simulates HeaderManager
+        BufferPool     bp(dm);
+        WALManager     wal(WAL_FILE, bp);
+        CatalogManager cat(bp, wal);
+        cat.load(true);
+
+        TableSchema schema;
+        schema.name                = "t";
+        schema.root_page           = INVALID_PAGE;
+        schema.primary_key_indices = {0};
+
+        Column id;
+        id.name           = "id";
+        id.type           = ColumnType::INT;
+        id.max_length     = 0;
+        id.is_nullable    = false;
+        id.is_primary_key = true;
+        id.auto_increment = false;
+
+        Column status;
+        status.name           = "status";
+        status.type           = ColumnType::VARCHAR;
+        status.max_length     = 10;
+        status.is_nullable    = true;
+        status.is_primary_key = false;
+        status.auto_increment = false;
+        status.has_default    = true;
+        status.default_value  = std::string("active");
+
+        schema.columns = {id, status};
+        cat.create_table(schema);
+    }
+
+    // reopen
+    DiskManager    dm2(DB_FILE);
+    BufferPool     bp2(dm2);
+    WALManager     wal2(WAL_FILE, bp2);
+    wal2.recover();
+    CatalogManager cat2(bp2, wal2);
+    cat2.load(false);
+
+    const TableSchema& t = cat2.get_table("t");
+    assert(t.columns[0].has_default == false);
+    assert(t.columns[1].has_default == true);
+    assert(std::get<std::string>(t.columns[1].default_value) == "active");
+
+    std::cout << "[PASS] column DEFAULT clause persists correctly across restart\n";
+    cleanup();
+}
+
 void test_catalog_update_table_root() {
     cleanup();
     DiskManager    dm(DB_FILE);
@@ -388,6 +442,7 @@ int main() {
     test_catalog_drop_nonexistent_table_throws();
     test_catalog_list_tables();
     test_catalog_persists_across_restart();
+    test_catalog_persists_column_default();
     test_catalog_update_table_root();
     test_catalog_create_and_get_index();
     test_catalog_get_indexes_for_table();

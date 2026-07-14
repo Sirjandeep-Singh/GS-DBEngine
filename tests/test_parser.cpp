@@ -253,6 +253,18 @@ void test_insert_with_float() {
     std::cout << "[PASS] INSERT with FLOAT value\n";
 }
 
+void test_insert_with_default_keyword() {
+    auto stmt = parse("INSERT INTO users (name, score) VALUES ('Alice', DEFAULT);");
+    auto& s = std::get<InsertStmt>(stmt);
+
+    assert(s.value_is_default.size() == 2);
+    assert(s.value_is_default[0] == false);
+    assert(s.value_is_default[1] == true);
+    assert(is_null(s.values[1]));  // placeholder — Executor resolves the real default
+
+    std::cout << "[PASS] INSERT VALUES with the DEFAULT keyword\n";
+}
+
 // ─────────────────────────────────────────────
 // UPDATE Tests
 // ─────────────────────────────────────────────
@@ -289,6 +301,16 @@ void test_update_without_where() {
     assert(std::get<bool>(s.assignments[0].value) == false);
 
     std::cout << "[PASS] UPDATE table SET col = val (no WHERE)\n";
+}
+
+void test_update_set_default_keyword() {
+    auto stmt = parse("UPDATE users SET status = DEFAULT WHERE id = 1;");
+    auto& s = std::get<UpdateStmt>(stmt);
+
+    assert(s.assignments[0].column_name == "status");
+    assert(s.assignments[0].is_default  == true);
+
+    std::cout << "[PASS] UPDATE SET col = DEFAULT\n";
 }
 
 // ─────────────────────────────────────────────
@@ -388,6 +410,34 @@ void test_create_table_not_null() {
     assert(s.columns[3].is_nullable == false);
 
     std::cout << "[PASS] CREATE TABLE NOT NULL constraint\n";
+}
+
+
+void test_create_table_default_clause() {
+    auto stmt = parse(
+        "CREATE TABLE users ("
+        "  id INT PRIMARY KEY AUTO_INCREMENT,"
+        "  status VARCHAR(10) DEFAULT 'active',"
+        "  score INT DEFAULT 0,"
+        "  active BOOLEAN DEFAULT TRUE"
+        ");");
+    auto& s = std::get<CreateTableStmt>(stmt);
+
+    assert(s.columns[0].has_default == false);
+
+    assert(s.columns[1].name        == "status");
+    assert(s.columns[1].has_default == true);
+    assert(std::get<std::string>(s.columns[1].default_value) == "active");
+
+    assert(s.columns[2].name        == "score");
+    assert(s.columns[2].has_default == true);
+    assert(std::get<int32_t>(s.columns[2].default_value) == 0);
+
+    assert(s.columns[3].name        == "active");
+    assert(s.columns[3].has_default == true);
+    assert(std::get<bool>(s.columns[3].default_value) == true);
+
+    std::cout << "[PASS] CREATE TABLE DEFAULT clause (string/int/bool literals)\n";
 }
 
 
@@ -570,11 +620,13 @@ int main() {
     test_insert_without_columns();
     test_insert_with_null();
     test_insert_with_float();
+    test_insert_with_default_keyword();
 
     std::cout << "\n=== UPDATE Tests ===\n";
     test_update_single_column();
     test_update_multiple_columns();
     test_update_without_where();
+    test_update_set_default_keyword();
 
     std::cout << "\n=== DELETE Tests ===\n";
     test_delete_with_where();
@@ -584,6 +636,7 @@ int main() {
     test_create_table_basic();
     test_create_table_float_column();
     test_create_table_not_null();
+    test_create_table_default_clause();
 
     std::cout << "\n=== DROP TABLE Tests ===\n";
     test_drop_table();

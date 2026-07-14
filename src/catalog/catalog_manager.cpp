@@ -49,6 +49,26 @@ void CatalogManager::drop_table(const std::string& table_name) {
         throw std::runtime_error("CatalogManager::drop_table: table does not exist: " + table_name);
     }
     tables_.erase(table_name);
+
+    // Drop every index belonging to this table too — both user-created
+    // (CREATE INDEX) and the auto-named ones backing UNIQUE constraints
+    // (see Executor::execute_create_table). Without this, dropping the
+    // table leaves IndexSchema entries in indexes_ pointing at a
+    // table_name that no longer exists: get_indexes_for_table() would
+    // wrongly attach them to a future table created with the same name,
+    // and their names would stay permanently reserved even though nothing
+    // references them anymore. This mirrors DROP INDEX's existing gap of
+    // not reclaiming the underlying B+ tree pages via the free list — that
+    // page-orphaning is a separate, pre-existing limitation this doesn't
+    // attempt to fix, only the catalog-metadata leak.
+    for (auto it = indexes_.begin(); it != indexes_.end(); ) {
+        if (it->second.table_name == table_name) {
+            it = indexes_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     persist();
 }
 
@@ -102,6 +122,19 @@ std::vector<IndexSchema> CatalogManager::get_indexes_for_table(const std::string
     for (auto& [_, idx] : indexes_) {
         if (idx.table_name == table_name) {
             result.push_back(idx);
+        }
+    }
+    return result;
+}
+
+std::vector<std::pair<std::string, ForeignKeyConstraint>>
+CatalogManager::get_foreign_keys_referencing(const std::string& parent_table) const {
+    std::vector<std::pair<std::string, ForeignKeyConstraint>> result;
+    for (auto& [_, schema] : tables_) {
+        for (auto& fk : schema.foreign_keys) {
+            if (fk.ref_table == parent_table) {
+                result.emplace_back(schema.name, fk);
+            }
         }
     }
     return result;
@@ -251,12 +284,28 @@ std::vector<uint8_t> CatalogManager::serialize() const {
             write_uint8(buf, col.is_nullable    ? 1 : 0);
             write_uint8(buf, col.is_primary_key ? 1 : 0);
             write_uint8(buf, col.auto_increment ? 1 : 0);
+            write_uint8(buf, col.has_default    ? 1 : 0);
+            if (col.has_default) {
+                write_value(buf, col.default_value);
+            }
         }
         write_uint32(buf, static_cast<uint32_t>(schema.checks.size()));
         for (auto& c : schema.checks) {
             write_uint32(buf, c.column_index);
             write_uint8(buf, static_cast<uint8_t>(c.op));
             write_value(buf, c.operand);
+        }
+
+        write_uint32(buf, static_cast<uint32_t>(schema.foreign_keys.size()));
+        for (auto& fk : schema.foreign_keys) {
+            write_uint32(buf, static_cast<uint32_t>(fk.column_indices.size()));
+            for (uint32_t ci : fk.column_indices) write_uint32(buf, ci);
+            write_string(buf, fk.ref_table);
+            write_uint32(buf, static_cast<uint32_t>(fk.ref_column_indices.size()));
+            for (uint32_t ci : fk.ref_column_indices) write_uint32(buf, ci);
+            write_uint8(buf, static_cast<uint8_t>(fk.on_delete));
+            write_string(buf, fk.child_index_name);
+            write_string(buf, fk.ref_index_name);
         }
     }
 
@@ -307,6 +356,10 @@ void CatalogManager::deserialize(const std::vector<uint8_t>& data) {
             col.is_nullable    = read_uint8(data, pos) != 0;
             col.is_primary_key = read_uint8(data, pos) != 0;
             col.auto_increment = read_uint8(data, pos) != 0;
+            col.has_default    = read_uint8(data, pos) != 0;
+            if (col.has_default) {
+                col.default_value = read_value(data, pos);
+            }
             schema.columns.push_back(col);
         }
 
@@ -317,6 +370,26 @@ void CatalogManager::deserialize(const std::vector<uint8_t>& data) {
             c.op            = static_cast<CheckOp>(read_uint8(data, pos));
             c.operand       = read_value(data, pos);
             schema.checks.push_back(std::move(c));
+        }
+
+        uint32_t num_fks = read_uint32(data, pos);
+        for (uint32_t j = 0; j < num_fks; j++) {
+            ForeignKeyConstraint fk;
+            uint32_t num_fk_cols = read_uint32(data, pos);
+            fk.column_indices.reserve(num_fk_cols);
+            for (uint32_t k = 0; k < num_fk_cols; k++) {
+                fk.column_indices.push_back(read_uint32(data, pos));
+            }
+            fk.ref_table = read_string(data, pos);
+            uint32_t num_ref_cols = read_uint32(data, pos);
+            fk.ref_column_indices.reserve(num_ref_cols);
+            for (uint32_t k = 0; k < num_ref_cols; k++) {
+                fk.ref_column_indices.push_back(read_uint32(data, pos));
+            }
+            fk.on_delete        = static_cast<FkOnDelete>(read_uint8(data, pos));
+            fk.child_index_name = read_string(data, pos);
+            fk.ref_index_name   = read_string(data, pos);
+            schema.foreign_keys.push_back(std::move(fk));
         }
 
         tables_[schema.name] = schema;

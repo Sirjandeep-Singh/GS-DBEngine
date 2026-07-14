@@ -140,6 +140,13 @@ struct InsertStmt {
     std::string              table_name;
     std::vector<std::string> columns;    // empty = insert in schema order
     std::vector<Value>       values;
+    // Parallel to values — true at index i means the i-th VALUES slot was
+    // written as the literal keyword DEFAULT rather than an actual value,
+    // e.g. INSERT INTO t VALUES (1, DEFAULT, 'x'). values[i] is a
+    // placeholder (NULL) in that case; Executor resolves it against the
+    // column's schema default instead. Empty vector means no slot used
+    // DEFAULT (the common case) — same as all-false.
+    std::vector<bool>        value_is_default;
 };
 
 // ─────────────────────────────────────────────
@@ -149,6 +156,9 @@ struct InsertStmt {
 struct SetClause {
     std::string column_name;
     Value       value;
+    // true for `SET col = DEFAULT` — value is a placeholder (NULL) in that
+    // case; Executor resolves it against the column's schema default.
+    bool        is_default = false;
 };
 
 struct UpdateStmt {
@@ -178,7 +188,48 @@ struct ColumnDef {
     bool        is_primary_key   = false;
     bool        is_nullable      = true;
     bool        auto_increment   = false;
+    bool        is_unique        = false;    // column-level UNIQUE — Executor backs this with
+                                              // an auto-named unique secondary Index, same
+                                              // mechanism CREATE UNIQUE INDEX already uses.
+    bool        has_default      = false;    // was a DEFAULT (...) clause given?
+    Value       default_value;               // literal used when a column is omitted from
+                                              // an INSERT (or explicitly given as DEFAULT).
+                                              // Only meaningful when has_default is true.
     WhereExprPtr check           = nullptr;  // column-level CHECK (...), null if none
+
+    // column-level `REFERENCES parent_table(parent_column)` shorthand —
+    // e.g. `customer_id INT REFERENCES customers(id)`. Empty string means
+    // no inline FK on this column. Always ON DELETE RESTRICT — there's no
+    // way to spell ON DELETE CASCADE inline; use the table-level FOREIGN
+    // KEY (...) clause (fk_table_name below) for that.
+    std::string fk_ref_table;
+    std::string fk_ref_column;
+};
+
+// ON DELETE behavior for a FOREIGN KEY constraint when a referenced parent
+// row is deleted (or updated in a way that changes the referenced column
+// values). RESTRICT is the default and the only option for a column-level
+// inline REFERENCES. There is deliberately no CASCADE-on-UPDATE distinct
+// from CASCADE-on-DELETE — Executor always treats an UPDATE that changes a
+// referenced column the same as RESTRICT, regardless of this setting; see
+// Executor::execute_update's FK handling for why.
+//
+// Named distinctly from catalog/schema.h's FkOnDelete (not just reused)
+// because this header and schema.h both end up included together in
+// executor.cpp — two enums of the same name in the same translation unit
+// would collide even though they live in different files.
+enum class ForeignKeyOnDelete {
+    RESTRICT = 1,
+    CASCADE  = 2,
+};
+
+// A table-level FOREIGN KEY (col1, ...) REFERENCES parent (col1, ...)
+// [ON DELETE CASCADE | ON DELETE RESTRICT] clause.
+struct ForeignKeyDef {
+    std::vector<std::string> columns;      // this table's FK columns, in order
+    std::string               ref_table;   // parent table name
+    std::vector<std::string>  ref_columns; // parent's referenced columns, same order/arity
+    ForeignKeyOnDelete         on_delete = ForeignKeyOnDelete::RESTRICT;
 };
 
 struct CreateTableStmt {
@@ -191,6 +242,17 @@ struct CreateTableStmt {
     // via is_primary_key). Mutually exclusive with an inline PRIMARY KEY —
     // Executor rejects CREATE TABLE statements that specify both.
     std::vector<std::string> table_primary_key;
+    // table-level UNIQUE (col1, col2, ...) clauses — one entry per clause,
+    // each naming the columns of one composite UNIQUE constraint. Distinct
+    // from a column-level UNIQUE (ColumnDef::is_unique), which only ever
+    // covers that single column. Multiple table-level UNIQUE clauses are
+    // allowed, same as multiple CHECK clauses.
+    std::vector<std::vector<std::string>> table_unique;
+    // table-level FOREIGN KEY (...) REFERENCES ... clauses. Column-level
+    // inline REFERENCES (ColumnDef::fk_ref_table) are folded into this
+    // same list by Executor::execute_create_table before validation, so
+    // downstream FK handling only ever has to look in one place.
+    std::vector<ForeignKeyDef> foreign_keys;
 };
 
 // ─────────────────────────────────────────────

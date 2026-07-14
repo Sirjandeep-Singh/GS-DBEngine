@@ -100,6 +100,66 @@ void test_create_table_duplicate_throws() {
     cleanup();
 }
 
+void test_create_table_default_clause() {
+    cleanup();
+    Env env;
+
+    auto r = exec(env,
+        "CREATE TABLE users ("
+        "  id     INT PRIMARY KEY AUTO_INCREMENT,"
+        "  name   VARCHAR(50) NOT NULL,"
+        "  status VARCHAR(10) DEFAULT 'active',"
+        "  score  INT DEFAULT 0,"
+        "  active BOOLEAN DEFAULT TRUE"
+        ");");
+
+    assert(r.success);
+    assert(env.cat.table_exists("users"));
+
+    std::cout << "[PASS] CREATE TABLE accepts DEFAULT clauses of every literal type\n";
+    cleanup();
+}
+
+void test_create_table_default_null_on_not_null_throws() {
+    cleanup();
+    Env env;
+
+    auto r = exec(env,
+        "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(10) NOT NULL DEFAULT NULL);");
+
+    assert(!r.success);
+    assert(!r.error_message.empty());
+
+    std::cout << "[PASS] DEFAULT NULL on a NOT NULL column returns error\n";
+    cleanup();
+}
+
+void test_create_table_default_type_mismatch_throws() {
+    cleanup();
+    Env env;
+
+    auto r = exec(env, "CREATE TABLE t (id INT PRIMARY KEY, score INT DEFAULT 'oops');");
+
+    assert(!r.success);
+    assert(!r.error_message.empty());
+
+    std::cout << "[PASS] DEFAULT with a mismatched literal type returns error\n";
+    cleanup();
+}
+
+void test_create_table_default_with_auto_increment_throws() {
+    cleanup();
+    Env env;
+
+    auto r = exec(env, "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT DEFAULT 5);");
+
+    assert(!r.success);
+    assert(!r.error_message.empty());
+
+    std::cout << "[PASS] Combining DEFAULT with AUTO_INCREMENT returns error\n";
+    cleanup();
+}
+
 // ─────────────────────────────────────────────
 // INSERT Tests
 // ─────────────────────────────────────────────
@@ -127,6 +187,159 @@ void test_insert_not_null_violation() {
     assert(!r.success);
 
     std::cout << "[PASS] INSERT with NULL into NOT NULL column returns error\n";
+    cleanup();
+}
+
+void test_insert_omitted_column_uses_default() {
+    cleanup();
+    Env env;
+    exec(env,
+        "CREATE TABLE users ("
+        "  id     INT PRIMARY KEY AUTO_INCREMENT,"
+        "  name   VARCHAR(50) NOT NULL,"
+        "  status VARCHAR(10) DEFAULT 'active'"
+        ");");
+
+    // status is omitted entirely — should fall back to 'active'
+    auto r = exec(env, "INSERT INTO users (name) VALUES ('Alice');");
+    assert(r.success);
+
+    auto sel = exec(env, "SELECT status FROM users WHERE name = 'Alice';");
+    assert(sel.success);
+    assert(sel.rows.size() == 1);
+    assert(sel.rows[0][0] == "active");
+
+    std::cout << "[PASS] INSERT with column omitted from named list uses column DEFAULT\n";
+    cleanup();
+}
+
+void test_insert_omitted_column_no_default_stays_null() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(10), age INT);");
+
+    auto r = exec(env, "INSERT INTO t (id, name) VALUES (1, 'x');");
+    assert(r.success);
+
+    auto sel = exec(env, "SELECT age FROM t WHERE id = 1;");
+    assert(sel.success);
+    assert(sel.rows[0][0] == "NULL");
+
+    std::cout << "[PASS] Omitted column with no DEFAULT still falls back to NULL\n";
+    cleanup();
+}
+
+void test_insert_explicit_value_overrides_default() {
+    cleanup();
+    Env env;
+    exec(env,
+        "CREATE TABLE users (id INT PRIMARY KEY, status VARCHAR(10) DEFAULT 'active');");
+
+    auto r = exec(env, "INSERT INTO users (id, status) VALUES (1, 'banned');");
+    assert(r.success);
+
+    auto sel = exec(env, "SELECT status FROM users WHERE id = 1;");
+    assert(sel.rows[0][0] == "banned");
+
+    std::cout << "[PASS] Explicit INSERT value overrides column DEFAULT\n";
+    cleanup();
+}
+
+void test_insert_positional_default_keyword() {
+    cleanup();
+    Env env;
+    exec(env,
+        "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50) NOT NULL,"
+        " score INT DEFAULT 100);");
+
+    auto r = exec(env, "INSERT INTO users VALUES (1, 'Alice', DEFAULT);");
+    assert(r.success);
+
+    auto sel = exec(env, "SELECT score FROM users WHERE id = 1;");
+    assert(sel.success);
+    assert(sel.rows[0][0] == "100");
+
+    std::cout << "[PASS] Positional INSERT VALUES accepts the DEFAULT keyword\n";
+    cleanup();
+}
+
+void test_insert_named_default_keyword() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE users (id INT PRIMARY KEY, score INT DEFAULT 42);");
+
+    auto r = exec(env, "INSERT INTO users (id, score) VALUES (1, DEFAULT);");
+    assert(r.success);
+
+    auto sel = exec(env, "SELECT score FROM users WHERE id = 1;");
+    assert(sel.rows[0][0] == "42");
+
+    std::cout << "[PASS] Named-column INSERT VALUES accepts the DEFAULT keyword\n";
+    cleanup();
+}
+
+void test_insert_default_keyword_no_default_is_null() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE t (id INT PRIMARY KEY, age INT);");
+
+    auto r = exec(env, "INSERT INTO t VALUES (1, DEFAULT);");
+    assert(r.success);
+
+    auto sel = exec(env, "SELECT age FROM t WHERE id = 1;");
+    assert(sel.rows[0][0] == "NULL");
+
+    std::cout << "[PASS] DEFAULT keyword on a column with no DEFAULT clause yields NULL\n";
+    cleanup();
+}
+
+void test_insert_default_keyword_on_not_null_without_default_fails() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(10) NOT NULL);");
+
+    auto r = exec(env, "INSERT INTO t VALUES (1, DEFAULT);");
+    assert(!r.success);
+
+    std::cout << "[PASS] DEFAULT keyword on a NOT NULL column without a DEFAULT clause fails\n";
+    cleanup();
+}
+
+void test_insert_default_pk_omitted_still_auto_increments() {
+    cleanup();
+    Env env;
+    exec(env,
+        "CREATE TABLE t (id INT PRIMARY KEY AUTO_INCREMENT, "
+        " status VARCHAR(10) DEFAULT 'new');");
+
+    auto r1 = exec(env, "INSERT INTO t (status) VALUES ('given');");
+    auto r2 = exec(env, "INSERT INTO t (id) VALUES (DEFAULT);");  // id: no DEFAULT -> NULL -> auto-increment
+    assert(r1.success);
+    assert(r2.success);
+
+    auto sel = exec(env, "SELECT id, status FROM t ORDER BY id;");
+    assert(sel.rows.size() == 2);
+    assert(sel.rows[0][1] == "given");
+    assert(sel.rows[1][1] == "new");
+    assert(sel.rows[0][0] != sel.rows[1][0]);  // distinct, auto-assigned ids
+
+    std::cout << "[PASS] Omitted AUTO_INCREMENT primary key still auto-increments alongside other DEFAULTs\n";
+    cleanup();
+}
+
+void test_insert_default_value_validated_against_check() {
+    cleanup();
+    Env env;
+    // default (5) satisfies the CHECK, so a normal insert succeeds
+    exec(env, "CREATE TABLE t (id INT PRIMARY KEY, score INT DEFAULT 5 CHECK (score > 0));");
+
+    auto r = exec(env, "INSERT INTO t (id) VALUES (1);");
+    assert(r.success);
+
+    auto sel = exec(env, "SELECT score FROM t WHERE id = 1;");
+    assert(sel.rows[0][0] == "5");
+
+    std::cout << "[PASS] Resolved DEFAULT value is validated against CHECK constraints like any other value\n";
     cleanup();
 }
 
@@ -361,6 +574,38 @@ void test_update_all_rows() {
     assert(r.rows_affected == 2);
 
     std::cout << "[PASS] UPDATE without WHERE modifies all rows\n";
+    cleanup();
+}
+
+void test_update_set_default() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE t (id INT PRIMARY KEY, status VARCHAR(10) DEFAULT 'active');");
+    exec(env, "INSERT INTO t (id, status) VALUES (1, 'banned');");
+
+    auto r = exec(env, "UPDATE t SET status = DEFAULT WHERE id = 1;");
+    assert(r.success);
+
+    auto sel = exec(env, "SELECT status FROM t WHERE id = 1;");
+    assert(sel.rows[0][0] == "active");
+
+    std::cout << "[PASS] UPDATE SET col = DEFAULT resolves to the column's schema default\n";
+    cleanup();
+}
+
+void test_update_set_default_no_default_sets_null() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE t (id INT PRIMARY KEY, age INT);");
+    exec(env, "INSERT INTO t VALUES (1, 30);");
+
+    auto r = exec(env, "UPDATE t SET age = DEFAULT WHERE id = 1;");
+    assert(r.success);
+
+    auto sel = exec(env, "SELECT age FROM t WHERE id = 1;");
+    assert(sel.rows[0][0] == "NULL");
+
+    std::cout << "[PASS] UPDATE SET col = DEFAULT on a column with no DEFAULT clause sets NULL\n";
     cleanup();
 }
 
@@ -1131,10 +1376,23 @@ int main() {
     std::cout << "\n=== CREATE TABLE Tests ===\n";
     test_create_table();
     test_create_table_duplicate_throws();
+    test_create_table_default_clause();
+    test_create_table_default_null_on_not_null_throws();
+    test_create_table_default_type_mismatch_throws();
+    test_create_table_default_with_auto_increment_throws();
 
     std::cout << "\n=== INSERT Tests ===\n";
     test_insert_and_rows_affected();
     test_insert_not_null_violation();
+    test_insert_omitted_column_uses_default();
+    test_insert_omitted_column_no_default_stays_null();
+    test_insert_explicit_value_overrides_default();
+    test_insert_positional_default_keyword();
+    test_insert_named_default_keyword();
+    test_insert_default_keyword_no_default_is_null();
+    test_insert_default_keyword_on_not_null_without_default_fails();
+    test_insert_default_pk_omitted_still_auto_increments();
+    test_insert_default_value_validated_against_check();
 
     std::cout << "\n=== SELECT Tests ===\n";
     test_select_star();
@@ -1152,6 +1410,8 @@ int main() {
     std::cout << "\n=== UPDATE Tests ===\n";
     test_update_where();
     test_update_all_rows();
+    test_update_set_default();
+    test_update_set_default_no_default_sets_null();
 
     std::cout << "\n=== DELETE Tests ===\n";
     test_delete_where();

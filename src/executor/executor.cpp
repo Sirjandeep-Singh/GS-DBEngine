@@ -38,6 +38,23 @@ static bool like_match(const std::string& text,
     return false;
 }
 
+// Checks that a literal Value's active alternative matches the storage
+// type a column actually expects. Deliberately as strict as
+// RowSerializer::serialize (no int/float coercion) — a DEFAULT literal
+// takes the exact same path into storage that an ordinary INSERT value
+// does, so it must satisfy the exact same constraint or every row that
+// falls back to it would fail to serialize.
+static bool value_matches_type(const Value& v, ColumnType col_type)
+{
+    switch (col_type) {
+        case ColumnType::INT:     return std::holds_alternative<int32_t>(v);
+        case ColumnType::FLOAT:   return std::holds_alternative<float>(v);
+        case ColumnType::BOOLEAN: return std::holds_alternative<bool>(v);
+        case ColumnType::VARCHAR: return std::holds_alternative<std::string>(v);
+    }
+    return false;
+}
+
 // Coerces a WHERE literal to the type an indexed column actually stores,
 // mirroring the int/float promotion evaluate_compare's EQ case already
 // applies (see the std::visit block there). A raw B+ tree key comparison
@@ -535,6 +552,171 @@ QueryResult Executor::execute_create_table(const CreateTableStmt& stmt)
                        "': no PRIMARY KEY column defined"};
     }
 
+    // ── UNIQUE constraints (column-level `col TYPE UNIQUE` and table-level
+    //    `UNIQUE (col1, col2, ...)`) are both backed by an auto-named
+    //    unique secondary Index — the exact same machinery CREATE UNIQUE
+    //    INDEX already uses (see execute_create_index below). Collect every
+    //    such constraint here as a column-name group; validated and
+    //    deduped now, actually built into Index objects further down once
+    //    the table itself exists.
+    std::vector<std::vector<std::string>> unique_groups;
+
+    for (const auto& col_def : stmt.columns) {
+        if (col_def.is_unique) {
+            unique_groups.push_back({col_def.name});
+        }
+    }
+    for (const auto& group : stmt.table_unique) {
+        if (group.empty()) {
+            return {false, "CREATE TABLE '" + stmt.table_name +
+                           "': UNIQUE (...) clause names no columns"};
+        }
+        for (const std::string& col_name : group) {
+            if (schema.column_index(col_name) < 0) {
+                return {false, "CREATE TABLE '" + stmt.table_name +
+                               "': UNIQUE column '" + col_name + "' does not exist"};
+            }
+        }
+        unique_groups.push_back(group);
+    }
+
+    // Dedupe against the primary key (the primary B+ tree already enforces
+    // that uniqueness — a second index over the exact same columns would
+    // be pure waste) and against each other (the same column set declared
+    // unique twice, e.g. once inline and once via a table-level clause).
+    auto same_columns = [](std::vector<std::string> a, std::vector<std::string> b) {
+        std::sort(a.begin(), a.end());
+        std::sort(b.begin(), b.end());
+        return a == b;
+    };
+    std::vector<std::string> pk_names;
+    for (uint32_t idx : schema.primary_key_indices) {
+        pk_names.push_back(schema.columns[idx].name);
+    }
+
+    std::vector<std::vector<std::string>> unique_groups_to_build;
+    for (auto& group : unique_groups) {
+        if (same_columns(group, pk_names)) continue;
+        bool dup = false;
+        for (const auto& existing : unique_groups_to_build) {
+            if (same_columns(group, existing)) { dup = true; break; }
+        }
+        if (!dup) unique_groups_to_build.push_back(std::move(group));
+    }
+
+    // ── FOREIGN KEY constraints (column-level `col TYPE REFERENCES
+    //    parent(col)` shorthand and table-level `FOREIGN KEY (...)
+    //    REFERENCES ... [ON DELETE CASCADE|RESTRICT]`) are validated here
+    //    and folded into schema.foreign_keys. The child-side lookup Index
+    //    is actually built further down, once the table exists — same
+    //    two-step pattern the UNIQUE constraints above use.
+    //
+    // SCOPE / KNOWN LIMITATIONS (documented rather than silently wrong):
+    //   - The parent table must already exist. No forward references, and
+    //     no self-referencing FK — both would need this table's own (not
+    //     yet created) schema to validate against itself.
+    //   - REFERENCES columns must match, in the SAME declared order, either
+    //     the parent's primary key or an existing UNIQUE constraint on the
+    //     parent — this is what lets every parent-side lookup be a single
+    //     indexed find() with no reordering logic. A same-columns-
+    //     different-order REFERENCES is rejected with a clear error rather
+    //     than silently reordered.
+    //   - ON UPDATE has no CASCADE of its own: an UPDATE that changes a
+    //     referenced parent column is always treated as RESTRICT regardless
+    //     of the FK's ON DELETE action — see Executor::execute_update.
+    std::vector<ForeignKeyDef> fk_defs = stmt.foreign_keys;
+    for (const auto& col_def : stmt.columns) {
+        if (!col_def.fk_ref_table.empty()) {
+            ForeignKeyDef fk;
+            fk.columns     = {col_def.name};
+            fk.ref_table   = col_def.fk_ref_table;
+            fk.ref_columns = {col_def.fk_ref_column};
+            fk.on_delete   = ForeignKeyOnDelete::RESTRICT;
+            fk_defs.push_back(std::move(fk));
+        }
+    }
+
+    for (const auto& fk : fk_defs) {
+        if (fk.ref_table == stmt.table_name) {
+            return {false, "CREATE TABLE '" + stmt.table_name +
+                           "': self-referencing FOREIGN KEY constraints are not yet supported"};
+        }
+        if (!catalog_.table_exists(fk.ref_table)) {
+            return {false, "CREATE TABLE '" + stmt.table_name +
+                           "': FOREIGN KEY references unknown table '" + fk.ref_table + "'"};
+        }
+        if (fk.columns.empty() || fk.columns.size() != fk.ref_columns.size()) {
+            return {false, "CREATE TABLE '" + stmt.table_name +
+                           "': FOREIGN KEY column count does not match REFERENCES column count"};
+        }
+
+        const TableSchema& ref_schema = catalog_.get_table(fk.ref_table);
+
+        std::vector<uint32_t> col_indices, ref_col_indices;
+        for (size_t i = 0; i < fk.columns.size(); ++i) {
+            int idx = schema.column_index(fk.columns[i]);
+            if (idx < 0) {
+                return {false, "CREATE TABLE '" + stmt.table_name +
+                               "': FOREIGN KEY column '" + fk.columns[i] + "' does not exist"};
+            }
+            int ref_idx = ref_schema.column_index(fk.ref_columns[i]);
+            if (ref_idx < 0) {
+                return {false, "CREATE TABLE '" + stmt.table_name +
+                               "': REFERENCES column '" + fk.ref_columns[i] +
+                               "' does not exist on '" + fk.ref_table + "'"};
+            }
+            if (schema.columns[static_cast<size_t>(idx)].type !=
+                ref_schema.columns[static_cast<size_t>(ref_idx)].type) {
+                return {false, "CREATE TABLE '" + stmt.table_name +
+                               "': FOREIGN KEY column '" + fk.columns[i] +
+                               "' type does not match referenced column '" +
+                               fk.ref_columns[i] + "'"};
+            }
+            col_indices.push_back(static_cast<uint32_t>(idx));
+            ref_col_indices.push_back(static_cast<uint32_t>(ref_idx));
+        }
+
+        // ref_columns must match, in this exact order, the parent's primary
+        // key or an existing UNIQUE constraint — see the scope note above.
+        // Whichever it is gets resolved to a concrete lookup target now
+        // (ref_index_name empty = primary key; otherwise the matching
+        // UNIQUE index's name), so runtime enforcement never re-searches.
+        std::vector<std::string> ref_pk_names;
+        for (uint32_t idx : ref_schema.primary_key_indices) {
+            ref_pk_names.push_back(ref_schema.columns[idx].name);
+        }
+        bool matches_a_key = (fk.ref_columns == ref_pk_names);
+        std::string ref_index_name;  // "" means "the primary key"
+        if (!matches_a_key) {
+            for (const auto& ref_idx_schema : catalog_.get_indexes_for_table(fk.ref_table)) {
+                if (ref_idx_schema.is_unique && ref_idx_schema.column_names == fk.ref_columns) {
+                    matches_a_key   = true;
+                    ref_index_name  = ref_idx_schema.name;
+                    break;
+                }
+            }
+        }
+        if (!matches_a_key) {
+            return {false, "CREATE TABLE '" + stmt.table_name +
+                           "': REFERENCES columns on '" + fk.ref_table +
+                           "' must be its primary key or an existing UNIQUE constraint, "
+                           "in the same declared order"};
+        }
+
+        ForeignKeyConstraint constraint;
+        constraint.column_indices     = col_indices;
+        constraint.ref_table          = fk.ref_table;
+        constraint.ref_column_indices = ref_col_indices;
+        constraint.on_delete          = static_cast<FkOnDelete>(static_cast<uint8_t>(fk.on_delete));
+        constraint.ref_index_name     = ref_index_name;
+        constraint.child_index_name   = "__fk_" + stmt.table_name;
+        for (const std::string& col_name : fk.columns) {
+            constraint.child_index_name += "_" + col_name;
+        }
+
+        schema.foreign_keys.push_back(std::move(constraint));
+    }
+
     // Compile CHECK expressions (column-level, then table-level) into the
     // catalog's flat CheckConstraint list. Any unsupported shape (OR, NOT,
     // unknown column, etc.) aborts CREATE TABLE with a clear error instead
@@ -562,6 +744,55 @@ QueryResult Executor::execute_create_table(const CreateTableStmt& stmt)
     // Persist the newly allocated root page back into the catalog.
     catalog_.update_table_root(stmt.table_name, tbl.root_page());
 
+    // Back every UNIQUE constraint collected above with its own empty
+    // unique Index. No backfill scan is needed here (unlike CREATE INDEX
+    // on a pre-existing table) since this table has zero rows right now —
+    // that's what makes this simpler than execute_create_index, not harder.
+    // The generated name is namespaced with a double-underscore prefix a
+    // user-chosen CREATE INDEX name can't collide with, plus the (already
+    // known-unique) table name, so no additional collision check is needed.
+    for (const auto& group : unique_groups_to_build) {
+        IndexSchema index_schema;
+        index_schema.name       = "__unique_" + stmt.table_name;
+        for (const std::string& col_name : group) {
+            index_schema.name += "_" + col_name;
+        }
+        index_schema.table_name   = stmt.table_name;
+        index_schema.column_names = group;
+        index_schema.root_page    = INVALID_PAGE;
+        index_schema.is_unique    = true;
+
+        catalog_.create_index(index_schema);
+
+        Index idx(catalog_.get_index(index_schema.name), schema.primary_key_indices.size(),
+                   buffer_pool_, wal_, free_list_);
+        catalog_.update_index_root(index_schema.name, idx.root_page());
+    }
+
+    // Back every FOREIGN KEY constraint with a plain (non-unique) child-side
+    // Index over its column(s) — see ForeignKeyConstraint::child_index_name
+    // in schema.h for why: it's what makes "find every child row
+    // referencing this parent key" (needed for DELETE/UPDATE on the parent
+    // side — see execute_delete/execute_update) an indexed lookup instead
+    // of a full scan of every table that might reference this one. Same
+    // empty-table, no-backfill-needed reasoning as the UNIQUE loop above.
+    for (const auto& fk : schema.foreign_keys) {
+        IndexSchema index_schema;
+        index_schema.name = fk.child_index_name;
+        for (uint32_t col_idx : fk.column_indices) {
+            index_schema.column_names.push_back(schema.columns[col_idx].name);
+        }
+        index_schema.table_name = stmt.table_name;
+        index_schema.root_page  = INVALID_PAGE;
+        index_schema.is_unique  = false;  // many child rows may share one parent key
+
+        catalog_.create_index(index_schema);
+
+        Index idx(catalog_.get_index(index_schema.name), schema.primary_key_indices.size(),
+                   buffer_pool_, wal_, free_list_);
+        catalog_.update_index_root(index_schema.name, idx.root_page());
+    }
+
     return {true, "", {}, {}, 0};
 }
 
@@ -574,6 +805,8 @@ Column Executor::column_def_to_column(const ColumnDef& def) const
     col.is_primary_key = def.is_primary_key;
     col.auto_increment = def.auto_increment;
     col.max_length     = 0;
+    col.has_default    = def.has_default;
+    col.default_value  = def.default_value;
 
     if (def.type_name == "INT") {
         col.type = ColumnType::INT;
@@ -596,6 +829,28 @@ Column Executor::column_def_to_column(const ColumnDef& def) const
             "AUTO_INCREMENT is only valid on INT columns (column '" + def.name + "')");
     }
 
+    if (def.auto_increment && col.has_default) {
+        throw std::runtime_error(
+            "AUTO_INCREMENT and DEFAULT cannot both be specified on column '" + def.name + "'");
+    }
+
+    if (col.has_default) {
+        if (is_null(col.default_value)) {
+            if (!col.is_nullable) {
+                throw std::runtime_error(
+                    "DEFAULT NULL is not valid on NOT NULL column '" + def.name + "'");
+            }
+        } else if (!value_matches_type(col.default_value, col.type)) {
+            throw std::runtime_error(
+                "DEFAULT value type does not match column '" + def.name +
+                "' (" + column_type_name(col.type) + ")");
+        } else if (col.type == ColumnType::VARCHAR &&
+                   get_string(col.default_value).size() > col.max_length) {
+            throw std::runtime_error(
+                "DEFAULT value exceeds max_length for column '" + def.name + "'");
+        }
+    }
+
     return col;
 }
 
@@ -608,6 +863,20 @@ QueryResult Executor::execute_drop_table(const DropTableStmt& stmt)
     if (!catalog_.table_exists(stmt.table_name)) {
         return {false, "Table '" + stmt.table_name + "' does not exist"};
     }
+
+    // RESTRICT-only, no CASCADE-drop: if some other table's FOREIGN KEY
+    // still references this one, refuse rather than silently leaving that
+    // constraint dangling (CatalogManager::drop_table only cleans up THIS
+    // table's own indexes/schema, not other tables' FK metadata pointing
+    // at it). The other table must drop its FK (or be dropped itself)
+    // first.
+    auto referencing = catalog_.get_foreign_keys_referencing(stmt.table_name);
+    if (!referencing.empty()) {
+        return {false, "DROP TABLE '" + stmt.table_name +
+                       "': still referenced by a FOREIGN KEY on table '" +
+                       referencing[0].first + "'"};
+    }
+
     catalog_.drop_table(stmt.table_name);
     return {true, "", {}, {}, 0};
 }
@@ -743,9 +1012,17 @@ QueryResult Executor::execute_insert(const InsertStmt& stmt)
     const TableSchema& schema = catalog_.get_table(stmt.table_name);
 
     // Build the row — values ordered to match schema column positions.
-    // Unspecified columns default to NULL (std::monostate).
+    // Unspecified columns default to NULL (std::monostate), unless the
+    // column has a DEFAULT clause — resolved below via `provided`.
     Row row;
     row.values.resize(schema.columns.size(), std::monostate{});
+
+    // Tracks which columns were actually given a value by this statement.
+    // false at index i means "fall back to schema default, or NULL if the
+    // column has none" — either because the column was omitted from a
+    // named column list, or because its VALUES slot was the literal
+    // keyword DEFAULT.
+    std::vector<bool> provided(schema.columns.size(), false);
 
     if (stmt.columns.empty()) {
         // INSERT INTO t VALUES (v1, v2, ...)  — positional, schema order
@@ -756,7 +1033,10 @@ QueryResult Executor::execute_insert(const InsertStmt& stmt)
                     std::to_string(schema.columns.size()) + ")"};
         }
         for (size_t i = 0; i < stmt.values.size(); ++i) {
+            bool is_default = i < stmt.value_is_default.size() && stmt.value_is_default[i];
+            if (is_default) continue;  // provided[i] stays false — use the schema default
             row.values[i] = stmt.values[i];
+            provided[i]   = true;
         }
     } else {
         // INSERT INTO t (col1, col2) VALUES (v1, v2)  — named columns
@@ -768,7 +1048,18 @@ QueryResult Executor::execute_insert(const InsertStmt& stmt)
             if (idx < 0) {
                 return {false, "INSERT: unknown column '" + stmt.columns[i] + "'"};
             }
+            bool is_default = i < stmt.value_is_default.size() && stmt.value_is_default[i];
+            if (is_default) continue;  // provided[idx] stays false — use the schema default
             row.values[static_cast<size_t>(idx)] = stmt.values[i];
+            provided[static_cast<size_t>(idx)]   = true;
+        }
+    }
+
+    // Resolve every unprovided column against its DEFAULT clause, if any.
+    // Columns with no DEFAULT keep the NULL they were pre-filled with above.
+    for (size_t i = 0; i < schema.columns.size(); ++i) {
+        if (!provided[i] && schema.columns[i].has_default) {
+            row.values[i] = schema.columns[i].default_value;
         }
     }
 
@@ -779,6 +1070,11 @@ QueryResult Executor::execute_insert(const InsertStmt& stmt)
                        schema.columns[c.column_index].name + "' (" +
                        schema.columns[c.column_index].name + " " +
                        check_op_symbol(c.op) + " " + value_to_string(c.operand) + ")"};
+    }
+
+    std::string fk_error = check_foreign_keys_on_write(schema, row);
+    if (!fk_error.empty()) {
+        return {false, "INSERT: " + fk_error};
     }
 
     auto  owned_indexes = open_indexes(schema);
@@ -1098,7 +1394,13 @@ QueryResult Executor::execute_update(const UpdateStmt& stmt)
         if (idx < 0) {
             return {false, "UPDATE: unknown column '" + asgn.column_name + "'"};
         }
-        new_values.emplace_back(static_cast<size_t>(idx), asgn.value);
+        if (asgn.is_default) {
+            const Column& col = schema.columns[static_cast<size_t>(idx)];
+            new_values.emplace_back(static_cast<size_t>(idx),
+                                     col.has_default ? col.default_value : Value{std::monostate{}});
+        } else {
+            new_values.emplace_back(static_cast<size_t>(idx), asgn.value);
+        }
     }
 
     auto      owned_indexes = open_indexes(schema);
@@ -1128,6 +1430,55 @@ QueryResult Executor::execute_update(const UpdateStmt& stmt)
                                schema.columns[c.column_index].name + "' (" +
                                schema.columns[c.column_index].name + " " +
                                check_op_symbol(c.op) + " " + value_to_string(c.operand) + ")"};
+            }
+        }
+    }
+
+    // Validate FOREIGN KEY constraints against every row's post-update
+    // values, same statement-level atomicity as CHECK above: a single
+    // violation aborts the whole UPDATE with no rows changed.
+    //   - child-side: if this table's OWN FK columns are being changed,
+    //     the new value must still reference an existing parent row.
+    //   - parent-side: if some OTHER table's FK references a column this
+    //     UPDATE is changing, and the OLD value still has child rows
+    //     pointing at it, the update is rejected — UPDATE always behaves
+    //     as RESTRICT here regardless of the FK's ON DELETE action (see
+    //     ForeignKeyConstraint::on_delete's comment for why: there's no
+    //     ON UPDATE CASCADE support yet).
+    auto inbound_fks = catalog_.get_foreign_keys_referencing(schema.name);
+    if (!schema.foreign_keys.empty() || !inbound_fks.empty()) {
+        for (const auto& match : matched) {
+            Row candidate = match.row;
+            for (const auto& [idx, val] : new_values) {
+                candidate.values[idx] = val;
+            }
+
+            if (!schema.foreign_keys.empty()) {
+                std::string fk_error = check_foreign_keys_on_write(schema, candidate);
+                if (!fk_error.empty()) {
+                    return {false, "UPDATE: " + fk_error};
+                }
+            }
+
+            if (!inbound_fks.empty()) {
+                bool touches_referenced_column = false;
+                for (const auto& [idx, val] : new_values) {
+                    if (match.row.get(idx) == val) continue;  // no actual change
+                    for (const auto& [child_table, fk] : inbound_fks) {
+                        (void)child_table;
+                        if (std::find(fk.ref_column_indices.begin(), fk.ref_column_indices.end(),
+                                      static_cast<uint32_t>(idx)) != fk.ref_column_indices.end()) {
+                            touches_referenced_column = true;
+                        }
+                    }
+                }
+                if (touches_referenced_column) {
+                    auto children = find_referencing_children(schema, match.row);
+                    if (!children.empty()) {
+                        return {false, "UPDATE: cannot change a value referenced by a FOREIGN "
+                                       "KEY constraint on table '" + children[0].child_table + "'"};
+                    }
+                }
             }
         }
     }
@@ -1162,40 +1513,53 @@ QueryResult Executor::execute_delete(const DeleteStmt& stmt)
 {
     const TableSchema& schema = catalog_.get_table(stmt.table_name);
 
-    auto      owned_indexes = open_indexes(schema);
-    Table     tbl(schema, buffer_pool_, wal_, free_list_, index_ptrs(owned_indexes));
+    Table     read_tbl(schema, buffer_pool_, wal_, free_list_);
     Predicate pred = build_predicate(stmt.where, schema);
 
-    uint32_t count = 0;
+    // Gather every matching primary key BEFORE deleting anything — same
+    // "match first, mutate second" shape execute_update already uses, and
+    // needed here regardless of FK constraints so delete_row_cascading
+    // below has a stable list to work through. Two paths exactly mirror
+    // the pre-FK version of this function: index-assisted (narrow via a
+    // usable WHERE-clause index, re-check the full predicate per
+    // candidate — see find_index_prefix) or a full scan when no index fits.
+    std::vector<Key> matched_keys;
     auto index_match = find_index_prefix(stmt.where, schema);
     if (index_match) {
-        // Index-assisted delete: fetch only candidate primary keys via the
-        // index, re-check each against the full predicate (the index only
-        // narrows candidates — see find_index_prefix), then delete each
-        // matched row directly. This is exactly what Table::delete_where does
-        // internally — collect matches, then delete each in its own
-        // transaction — just seeded from Index::find()/find_range() instead
-        // of a full Table::scan(). Unlike UPDATE, DELETE has no cross-row
-        // validation to preserve (no UNIQUE-index batch collision is
-        // possible from removing rows), so there's no atomicity difference
-        // from the scan-based path below.
         const IndexSchema& ischema = *index_match->index;
         Index idx(ischema, schema.primary_key_indices.size(), buffer_pool_, wal_, free_list_);
         for (const Key& pk : index_lookup(idx, *index_match)) {
-            std::optional<Row> row = tbl.select_by_key(pk);
+            std::optional<Row> row = read_tbl.select_by_key(pk);
             if (row && pred(*row)) {
-                tbl.delete_row(pk);
-                count++;
+                matched_keys.push_back(pk);
             }
         }
     } else {
-        count = tbl.delete_where(pred);
+        for (const auto& sr : read_tbl.scan(pred)) {
+            matched_keys.push_back(sr.primary_key);
+        }
     }
 
-    if (tbl.root_page() != schema.root_page) {
-        catalog_.update_table_root(stmt.table_name, tbl.root_page());
+    // Each row is deleted through delete_row_cascading, which checks every
+    // FOREIGN KEY referencing this table before removing anything (RESTRICT
+    // throws; CASCADE recursively removes referencing rows first — see its
+    // own comment). This opens a fresh Table (and re-persists roots) per
+    // row rather than batching one Table across the whole statement like
+    // the pre-FK version did — a real cost, traded for cascades being able
+    // to hop to a completely different table's B+ tree partway through.
+    // Also note: unlike execute_update's FK check (which validates every
+    // matched row up front, before mutating any of them), a RESTRICT
+    // violation partway through a multi-row DELETE leaves earlier rows (and
+    // their cascades) already deleted — this DELETE function never
+    // guaranteed full cross-row atomicity even before FKs existed (see the
+    // original comment this replaced: "DELETE has no cross-row validation
+    // to preserve").
+    uint32_t count = 0;
+    for (const Key& pk : matched_keys) {
+        if (delete_row_cascading(stmt.table_name, pk)) {
+            count++;
+        }
     }
-    persist_index_roots(tbl);
 
     return {true, "", {}, {}, count};
 }
@@ -1703,6 +2067,128 @@ int Executor::find_violated_check(const TableSchema& schema, const Row& row) con
         }
     }
     return -1;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FOREIGN KEY constraint enforcement — see executor.h for the two entry
+// points' contracts.
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::string Executor::check_foreign_keys_on_write(const TableSchema& schema, const Row& row) const
+{
+    for (const auto& fk : schema.foreign_keys) {
+        Key child_values;
+        bool any_null = false;
+        for (uint32_t col_idx : fk.column_indices) {
+            const Value& v = row.get(col_idx);
+            if (is_null(v)) { any_null = true; break; }
+            child_values.push_back(v);
+        }
+        // MATCH SIMPLE: any NULL component means "no reference" — the row
+        // is exempt from this constraint entirely, same convention
+        // Index::is_indexable already uses for NULL indexed values.
+        if (any_null) continue;
+
+        bool parent_exists;
+        if (fk.ref_index_name.empty()) {
+            // References the parent's primary key directly.
+            const TableSchema& ref_schema = catalog_.get_table(fk.ref_table);
+            Table ref_tbl(ref_schema, buffer_pool_, wal_, free_list_);
+            parent_exists = ref_tbl.select_by_key(child_values).has_value();
+        } else {
+            // References an existing UNIQUE secondary index.
+            const IndexSchema& ref_ischema = catalog_.get_index(fk.ref_index_name);
+            const TableSchema& ref_schema  = catalog_.get_table(fk.ref_table);
+            Index ref_idx(ref_ischema, ref_schema.primary_key_indices.size(),
+                          buffer_pool_, wal_, free_list_);
+            parent_exists = !ref_idx.find(child_values).empty();
+        }
+
+        if (!parent_exists) {
+            std::string cols;
+            for (size_t i = 0; i < fk.column_indices.size(); ++i) {
+                if (i > 0) cols += ", ";
+                cols += schema.columns[fk.column_indices[i]].name;
+            }
+            return "FOREIGN KEY violation: no row in '" + fk.ref_table +
+                   "' matches (" + cols + ") = (" +
+                   [&] {
+                       std::string vals;
+                       for (size_t i = 0; i < child_values.size(); ++i) {
+                           if (i > 0) vals += ", ";
+                           vals += value_to_string(child_values[i]);
+                       }
+                       return vals;
+                   }() + ")";
+        }
+    }
+    return "";
+}
+
+std::vector<Executor::ReferencingChildren> Executor::find_referencing_children(
+    const TableSchema& ref_schema, const Row& ref_row) const
+{
+    std::vector<ReferencingChildren> result;
+
+    for (const auto& [child_table, fk] : catalog_.get_foreign_keys_referencing(ref_schema.name)) {
+        Key parent_values;
+        bool any_null = false;
+        for (uint32_t ref_idx : fk.ref_column_indices) {
+            const Value& v = ref_row.get(ref_idx);
+            if (is_null(v)) { any_null = true; break; }
+            parent_values.push_back(v);
+        }
+        // A NULL referenced value was never indexed on the child side
+        // either (Index::is_indexable), so it can't have any referencing
+        // child rows — nothing to find.
+        if (any_null) continue;
+
+        const IndexSchema& child_ischema = catalog_.get_index(fk.child_index_name);
+        const TableSchema& child_schema  = catalog_.get_table(child_table);
+        Index child_idx(child_ischema, child_schema.primary_key_indices.size(),
+                        buffer_pool_, wal_, free_list_);
+        std::vector<Key> child_pks = child_idx.find(parent_values);
+
+        if (!child_pks.empty()) {
+            result.push_back({child_table, fk, std::move(child_pks)});
+        }
+    }
+
+    return result;
+}
+
+bool Executor::delete_row_cascading(const std::string& table_name, const Key& key)
+{
+    const TableSchema& schema = catalog_.get_table(table_name);
+
+    Table read_tbl(schema, buffer_pool_, wal_, free_list_);
+    std::optional<Row> row = read_tbl.select_by_key(key);
+    if (!row) return false;  // already removed by an earlier cascade this statement
+
+    for (const auto& child : find_referencing_children(schema, *row)) {
+        if (child.constraint.on_delete == FkOnDelete::RESTRICT) {
+            throw std::runtime_error(
+                "FOREIGN KEY violation: row in '" + table_name +
+                "' is still referenced by table '" + child.child_table + "'");
+        }
+        // CASCADE — remove every referencing child row first. Recurses
+        // through this same function, so a chain of CASCADE FKs (child has
+        // its own children referencing IT) cascades transitively.
+        for (const Key& child_pk : child.child_primary_keys) {
+            delete_row_cascading(child.child_table, child_pk);
+        }
+    }
+
+    auto  owned_indexes = open_indexes(schema);
+    Table tbl(schema, buffer_pool_, wal_, free_list_, index_ptrs(owned_indexes));
+    tbl.delete_row(key);
+
+    if (tbl.root_page() != schema.root_page) {
+        catalog_.update_table_root(table_name, tbl.root_page());
+    }
+    persist_index_roots(tbl);
+
+    return true;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
