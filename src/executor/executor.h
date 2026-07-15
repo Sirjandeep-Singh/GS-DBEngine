@@ -290,6 +290,22 @@ private:
     QueryResult execute_drop_index(const DropIndexStmt& stmt);
     QueryResult execute_show(const ShowStmt& stmt);
 
+    // DESCRIBE table_name — returns one row per column (Field, Type, Null,
+    // Key, Default, Extra), followed by a final row holding the fully
+    // reconstructed CREATE TABLE statement (in the "Field" cell, labeled
+    // "Create Table") so it can be copied and pasted to recreate the table
+    // elsewhere, the same way SHOW CREATE TABLE / \d work in other
+    // databases. See build_create_table_sql for how that statement is
+    // reconstructed from the catalog's TableSchema.
+    QueryResult execute_describe(const DescribeStmt& stmt);
+
+    // Reconstructs a CREATE TABLE statement (plus any CREATE [UNIQUE]
+    // INDEX statements for indexes not already implied by a constraint)
+    // that would recreate `schema` from scratch. Used by execute_describe;
+    // factored out separately since it only reads the catalog and never
+    // touches storage.
+    std::string build_create_table_sql(const TableSchema& schema) const;
+
     // These are handled by the Database class — return an error if reached.
     QueryResult execute_create_database(const CreateDatabaseStmt& stmt);
     QueryResult execute_drop_database(const DropDatabaseStmt& stmt);

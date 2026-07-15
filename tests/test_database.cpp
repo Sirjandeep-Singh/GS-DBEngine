@@ -343,6 +343,135 @@ void test_databases_list_persists_across_restart() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// DESCRIBE
+// ─────────────────────────────────────────────────────────────────────────────
+
+void test_describe_returns_column_breakdown() {
+    cleanup();
+    Database db = make_db();
+    db.execute("CREATE DATABASE mydb;");
+    db.execute("USE mydb;");
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50) NOT NULL, age INT DEFAULT 18);");
+
+    auto r = db.execute("DESCRIBE users;");
+    assert(r.success);
+    assert(r.columns == std::vector<std::string>({"Field", "Type", "Null", "Key", "Default", "Extra"}));
+    // 3 columns + the trailing "Create Table" row
+    assert(r.rows.size() == 4);
+    assert(r.rows[0][0] == "id");
+    assert(r.rows[0][3] == "PRI");
+    assert(r.rows[1][0] == "name");
+    assert(r.rows[1][2] == "NO");     // NOT NULL
+    assert(r.rows[2][0] == "age");
+    assert(r.rows[2][4] == "18");     // DEFAULT
+
+    std::cout << "[PASS] DESCRIBE returns a Field/Type/Null/Key/Default/Extra row per column\n";
+    cleanup();
+}
+
+void test_describe_returns_verbatim_create_table_text() {
+    cleanup();
+    Database db = make_db();
+    db.execute("CREATE DATABASE mydb;");
+    db.execute("USE mydb;");
+
+    const std::string create_sql =
+        "CREATE TABLE users (\n"
+        "    id INT PRIMARY KEY,\n"
+        "    email VARCHAR(100) NOT NULL UNIQUE\n"
+        ")";
+    db.execute(create_sql + ";");
+
+    auto r = db.execute("DESCRIBE users;");
+    assert(r.success);
+    const auto& last_row = r.rows.back();
+    assert(last_row[0] == "Create Table");
+    // Stored verbatim (see TableSchema::create_sql) — must round-trip
+    // byte-for-byte, not a reconstruction, so it's copy-paste-identical
+    // to what the person originally typed.
+    assert(last_row[1] == create_sql);
+
+    std::cout << "[PASS] DESCRIBE hands back the original CREATE TABLE text verbatim\n";
+    cleanup();
+}
+
+void test_describe_appends_live_index_statements() {
+    cleanup();
+    Database db = make_db();
+    db.execute("CREATE DATABASE mydb;");
+    db.execute("USE mydb;");
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, country VARCHAR(20));");
+    db.execute("CREATE INDEX idx_country ON users (country);");
+
+    auto r = db.execute("DESCRIBE users;");
+    assert(r.success);
+    const std::string& recreate = r.rows.back()[1];
+    // The stored CREATE TABLE text plus a live-assembled CREATE INDEX for
+    // the secondary index, which is its own statement in this grammar and
+    // was never part of the original CREATE TABLE text.
+    assert(recreate.find("CREATE INDEX idx_country ON users (country)") != std::string::npos);
+
+    std::cout << "[PASS] DESCRIBE appends CREATE INDEX statements for secondary indexes\n";
+    cleanup();
+}
+
+void test_describe_omits_auto_generated_constraint_indexes() {
+    cleanup();
+    Database db = make_db();
+    db.execute("CREATE DATABASE mydb;");
+    db.execute("USE mydb;");
+    db.execute("CREATE TABLE users (id INT PRIMARY KEY, email VARCHAR(50) UNIQUE);");
+
+    auto r = db.execute("DESCRIBE users;");
+    assert(r.success);
+    const std::string& recreate = r.rows.back()[1];
+    // The UNIQUE constraint's auto-generated backing index (__unique_...)
+    // must not appear as a separate CREATE INDEX — it's already implied
+    // by the UNIQUE keyword in the stored CREATE TABLE text, and pasting
+    // it back in as its own statement would fail with "already exists".
+    assert(recreate.find("__unique_") == std::string::npos);
+
+    std::cout << "[PASS] DESCRIBE excludes auto-generated UNIQUE/FK backing indexes from the recreate script\n";
+    cleanup();
+}
+
+void test_describe_nonexistent_table_fails() {
+    cleanup();
+    Database db = make_db();
+    db.execute("CREATE DATABASE mydb;");
+    db.execute("USE mydb;");
+
+    auto r = db.execute("DESCRIBE no_such_table;");
+    assert(!r.success);
+
+    std::cout << "[PASS] DESCRIBE on an unknown table fails\n";
+    cleanup();
+}
+
+void test_describe_survives_restart() {
+    cleanup();
+
+    const std::string create_sql = "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50))";
+    {
+        Database db = make_db();
+        db.execute("CREATE DATABASE mydb;");
+        db.execute("USE mydb;");
+        db.execute(create_sql + ";");
+    }
+
+    {
+        Database db = make_db();   // reopen same data_dir
+        db.execute("USE mydb;");
+        auto r = db.execute("DESCRIBE users;");
+        assert(r.success);
+        assert(r.rows.back()[1] == create_sql);
+    }
+
+    std::cout << "[PASS] DESCRIBE's stored CREATE TABLE text survives a restart\n";
+    cleanup();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -371,6 +500,14 @@ int main() {
     std::cout << "\n=== SHOW DATABASES Tests ===\n";
     test_show_databases();
     test_show_databases_empty();
+
+    std::cout << "\n=== DESCRIBE Tests ===\n";
+    test_describe_returns_column_breakdown();
+    test_describe_returns_verbatim_create_table_text();
+    test_describe_appends_live_index_statements();
+    test_describe_omits_auto_generated_constraint_indexes();
+    test_describe_nonexistent_table_fails();
+    test_describe_survives_restart();
 
     std::cout << "\n=== DROP DATABASE Tests ===\n";
     test_drop_database();

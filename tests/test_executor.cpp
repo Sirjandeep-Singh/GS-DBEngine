@@ -1369,6 +1369,46 @@ void test_data_survives_restart() {
 }
 
 // ─────────────────────────────────────────────
+// DESCRIBE
+// ─────────────────────────────────────────────
+
+// Statements here go straight through Executor::execute(Statement) via the
+// exec() helper above, never through Database::execute(sql) — so
+// CreateTableStmt::source_text (and therefore TableSchema::create_sql) is
+// always empty in this harness. That makes this the right place to
+// exercise build_create_table_sql's best-effort fallback reconstruction,
+// as opposed to the verbatim-text path covered in test_database.cpp.
+void test_describe_falls_back_to_reconstruction_without_stored_sql() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE users (id INT PRIMARY KEY, name VARCHAR(50) NOT NULL);");
+
+    auto r = exec(env, "DESCRIBE users;");
+    assert(r.success);
+    assert(r.rows.size() == 3);  // 2 columns + trailing "Create Table" row
+    assert(r.rows[0][0] == "id");
+    assert(r.rows[1][0] == "name");
+
+    const std::string& recreate = r.rows.back()[1];
+    assert(recreate.find("CREATE TABLE users") != std::string::npos);
+    assert(recreate.find("PRIMARY KEY") != std::string::npos);
+
+    std::cout << "[PASS] DESCRIBE falls back to reconstructing CREATE TABLE when no source text was stored\n";
+    cleanup();
+}
+
+void test_describe_unknown_table_fails() {
+    cleanup();
+    Env env;
+
+    auto r = exec(env, "DESCRIBE no_such_table;");
+    assert(!r.success);
+
+    std::cout << "[PASS] DESCRIBE on an unknown table fails\n";
+    cleanup();
+}
+
+// ─────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────
 
@@ -1466,6 +1506,10 @@ int main() {
 
     std::cout << "\n=== Persistence Tests ===\n";
     test_data_survives_restart();
+
+    std::cout << "\n=== DESCRIBE Tests ===\n";
+    test_describe_falls_back_to_reconstruction_without_stored_sql();
+    test_describe_unknown_table_fails();
 
     std::cout << "\nAll executor tests passed.\n";
     return 0;

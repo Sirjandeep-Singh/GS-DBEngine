@@ -6,7 +6,7 @@ enum class TokenType {
     // ---- Keywords ----
     SELECT, FROM, WHERE, INSERT, INTO, VALUES,
     UPDATE, SET, DELETE, CREATE, TABLE, DROP,
-    USE, SHOW, DATABASES, DATABASE, TABLES,
+    USE, SHOW, DATABASES, DATABASE, TABLES, DESCRIBE,
     INDEX, UNIQUE,
     AND, OR, NOT, NULL_KW,               // NULL_KW to avoid clash with NULL macro
     IS, LIKE, ORDER, BY, ASC, DESC,

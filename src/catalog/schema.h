@@ -147,6 +147,15 @@ struct TableSchema {
     std::vector<uint32_t>    primary_key_indices;
     std::vector<CheckConstraint> checks;     // CHECK constraints, all implicitly ANDed together
     std::vector<ForeignKeyConstraint> foreign_keys;  // FOREIGN KEY constraints on this table
+    // Verbatim text of the CREATE TABLE statement that created this table
+    // (trailing semicolon/whitespace trimmed), stashed at CREATE time by
+    // Executor::execute_create_table. DESCRIBE returns this as-is rather
+    // than reconstructing it field-by-field — same approach SQLite takes
+    // with sqlite_schema.sql. Empty for tables that predate this field
+    // (e.g. deserialized from an older catalog page) or that were built
+    // programmatically rather than through Database::execute(sql); callers
+    // should fall back to something reasonable in that case.
+    std::string create_sql;
 
     // returns the column index for a given column name, or -1 if not found
     int column_index(const std::string& col_name) const {

@@ -503,6 +503,15 @@ void test_show_databases() {
     std::cout << "[PASS] SHOW DATABASES\n";
 }
 
+void test_describe_table() {
+    auto stmt = parse("DESCRIBE users;");
+    auto& s = std::get<DescribeStmt>(stmt);
+
+    assert(s.table_name == "users");
+
+    std::cout << "[PASS] DESCRIBE table_name\n";
+}
+
 // ─────────────────────────────────────────────
 // Error Tests
 // ─────────────────────────────────────────────
@@ -647,6 +656,7 @@ int main() {
     test_use_database();
     test_show_tables();
     test_show_databases();
+    test_describe_table();
 
     std::cout << "\n=== Error Tests ===\n";
     test_unknown_statement_throws();

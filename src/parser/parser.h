@@ -83,6 +83,7 @@ private:
     Statement parse_drop_database();
     Statement parse_use();
     Statement parse_show();
+    Statement parse_describe();
 
     // ---- Clause parsers ----
 

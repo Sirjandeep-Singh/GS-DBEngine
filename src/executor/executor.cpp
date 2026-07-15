@@ -482,6 +482,8 @@ QueryResult Executor::execute(const Statement& stmt)
                 return execute_drop_index(s);
             if constexpr (std::is_same_v<T, ShowStmt>)
                 return execute_show(s);
+            if constexpr (std::is_same_v<T, DescribeStmt>)
+                return execute_describe(s);
             if constexpr (std::is_same_v<T, CreateDatabaseStmt>)
                 return execute_create_database(s);
             if constexpr (std::is_same_v<T, DropDatabaseStmt>)
@@ -509,6 +511,7 @@ QueryResult Executor::execute_create_table(const CreateTableStmt& stmt)
     TableSchema schema;
     schema.name             = stmt.table_name;
     schema.root_page        = INVALID_PAGE;  // BTree constructor will allocate
+    schema.create_sql       = stmt.source_text;  // may be empty if built by hand rather than via Database::execute(sql)
 
     int pk_count = 0;
     for (size_t i = 0; i < stmt.columns.size(); ++i) {
@@ -1585,8 +1588,128 @@ QueryResult Executor::execute_show(const ShowStmt& stmt)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Database-level stubs — these are handled by the Database class above us
+// DESCRIBE
 // ─────────────────────────────────────────────────────────────────────────────
+
+QueryResult Executor::execute_describe(const DescribeStmt& stmt)
+{
+    if (!catalog_.table_exists(stmt.table_name)) {
+        return {false, "Table '" + stmt.table_name + "' does not exist"};
+    }
+
+    const TableSchema& schema = catalog_.get_table(stmt.table_name);
+
+    QueryResult result;
+    result.success = true;
+    result.columns = {"Field", "Type", "Null", "Key", "Default", "Extra"};
+
+    std::vector<IndexSchema> indexes = catalog_.get_indexes_for_table(schema.name);
+
+    for (size_t i = 0; i < schema.columns.size(); ++i) {
+        const Column& col = schema.columns[i];
+
+        std::string type_str = column_type_name(col.type);
+        if (col.type == ColumnType::VARCHAR && col.max_length > 0) {
+            type_str += "(" + std::to_string(col.max_length) + ")";
+        }
+
+        bool is_pk = std::find(schema.primary_key_indices.begin(), schema.primary_key_indices.end(),
+                                static_cast<uint32_t>(i)) != schema.primary_key_indices.end();
+        std::string key;
+        if (is_pk) {
+            key = "PRI";
+        } else {
+            for (const auto& idx : indexes) {
+                if (idx.is_unique && idx.column_names.size() == 1 && idx.column_names[0] == col.name) {
+                    key = "UNI";
+                    break;
+                }
+            }
+            if (key.empty()) {
+                for (const auto& idx : indexes) {
+                    if (!idx.column_names.empty() && idx.column_names[0] == col.name) {
+                        key = "MUL";
+                        break;
+                    }
+                }
+            }
+        }
+
+        result.rows.push_back({
+            col.name,
+            type_str,
+            col.is_nullable ? "YES" : "NO",
+            key,
+            col.has_default ? value_to_string(col.default_value) : "NULL",
+            col.auto_increment ? "AUTO_INCREMENT" : ""
+        });
+    }
+
+    // Final row: the exact statement(s) that would recreate this table —
+    // stored verbatim from the original CREATE TABLE at the time it ran
+    // (see TableSchema::create_sql), the same way SQLite hands back
+    // sqlite_schema.sql rather than reconstructing it. Only the secondary
+    // CREATE INDEX statements are assembled live, since indexes are their
+    // own statement in this grammar and can be added at any time after the
+    // table exists.
+    result.rows.push_back({"Create Table", build_create_table_sql(schema), "", "", "", ""});
+
+    return result;
+}
+
+std::string Executor::build_create_table_sql(const TableSchema& schema) const
+{
+    std::string sql = schema.create_sql;
+
+    if (sql.empty()) {
+        // Best-effort fallback for a schema with no stored source text —
+        // e.g. deserialized from a catalog page written before this field
+        // existed, or a TableSchema built by hand (some tests do this)
+        // rather than through Database::execute(sql). Covers columns,
+        // types, NOT NULL and PRIMARY KEY only; UNIQUE/CHECK/FOREIGN
+        // KEY/DEFAULT detail isn't reconstructed here.
+        sql = "CREATE TABLE " + schema.name + " (\n";
+        for (size_t i = 0; i < schema.columns.size(); ++i) {
+            const Column& col = schema.columns[i];
+            sql += "    " + col.name + " " + column_type_name(col.type);
+            if (col.type == ColumnType::VARCHAR && col.max_length > 0) {
+                sql += "(" + std::to_string(col.max_length) + ")";
+            }
+            if (!col.is_nullable) sql += " NOT NULL";
+            sql += ",\n";
+        }
+        sql += "    PRIMARY KEY (";
+        for (size_t i = 0; i < schema.primary_key_indices.size(); ++i) {
+            if (i > 0) sql += ", ";
+            sql += schema.columns[schema.primary_key_indices[i]].name;
+        }
+        sql += ")\n)";
+    }
+
+    // Append any secondary index not already implied by a constraint.
+    // UNIQUE/PRIMARY KEY/FOREIGN KEY each auto-create their own backing
+    // index named with a "__unique_" or "__fk_" prefix a user-chosen
+    // CREATE INDEX name can never collide with (see execute_create_table
+    // and execute_create_index) — those are re-created implicitly by the
+    // CREATE TABLE statement above, so listing them again here would just
+    // produce a statement that fails with "index already exists" if
+    // pasted back in.
+    for (const IndexSchema& idx : catalog_.get_indexes_for_table(schema.name)) {
+        if (idx.name.rfind("__unique_", 0) == 0 || idx.name.rfind("__fk_", 0) == 0) {
+            continue;
+        }
+        sql += ";\n";
+        sql += idx.is_unique ? "CREATE UNIQUE INDEX " : "CREATE INDEX ";
+        sql += idx.name + " ON " + schema.name + " (";
+        for (size_t i = 0; i < idx.column_names.size(); ++i) {
+            if (i > 0) sql += ", ";
+            sql += idx.column_names[i];
+        }
+        sql += ")";
+    }
+
+    return sql;
+}
 
 QueryResult Executor::execute_create_database(const CreateDatabaseStmt&) {
     return {false, "CREATE DATABASE must be handled by the Database class"};

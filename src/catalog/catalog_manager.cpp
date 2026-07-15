@@ -307,6 +307,8 @@ std::vector<uint8_t> CatalogManager::serialize() const {
             write_string(buf, fk.child_index_name);
             write_string(buf, fk.ref_index_name);
         }
+
+        write_string(buf, schema.create_sql);
     }
 
     // indexes
@@ -391,6 +393,8 @@ void CatalogManager::deserialize(const std::vector<uint8_t>& data) {
             fk.ref_index_name   = read_string(data, pos);
             schema.foreign_keys.push_back(std::move(fk));
         }
+
+        schema.create_sql = read_string(data, pos);
 
         tables_[schema.name] = schema;
     }

@@ -136,6 +136,26 @@ QueryResult Database::execute(const std::string& sql)
         std::vector<Token> tokens = tokenizer.tokenize();
         Parser parser(std::move(tokens));
         Statement stmt = parser.parse();
+
+        // Stash the verbatim source text on CREATE TABLE statements so
+        // DESCRIBE can hand back exactly what the user typed later (the
+        // same approach SQLite takes with sqlite_schema.sql). Trim
+        // surrounding whitespace and a single trailing semicolon so the
+        // stored text is copy-paste-ready on its own.
+        if (auto* create = std::get_if<CreateTableStmt>(&stmt)) {
+            size_t begin = sql.find_first_not_of(" \t\r\n");
+            size_t end   = sql.find_last_not_of(" \t\r\n");
+            std::string trimmed = (begin == std::string::npos)
+                ? std::string()
+                : sql.substr(begin, end - begin + 1);
+            if (!trimmed.empty() && trimmed.back() == ';') {
+                trimmed.pop_back();
+                size_t end2 = trimmed.find_last_not_of(" \t\r\n");
+                trimmed = (end2 == std::string::npos) ? std::string() : trimmed.substr(0, end2 + 1);
+            }
+            create->source_text = std::move(trimmed);
+        }
+
         return execute(stmt);
     } catch (const std::exception& e) {
         return QueryResult{false, e.what()};

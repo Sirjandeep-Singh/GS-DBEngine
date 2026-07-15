@@ -253,6 +253,14 @@ struct CreateTableStmt {
     // same list by Executor::execute_create_table before validation, so
     // downstream FK handling only ever has to look in one place.
     std::vector<ForeignKeyDef> foreign_keys;
+    // Verbatim source text of this CREATE TABLE statement, trailing
+    // semicolon/whitespace trimmed. Populated by Database::execute(sql)
+    // right after parsing (the Parser itself never sees the raw string as
+    // a whole, only tokens) and copied into TableSchema::create_sql by
+    // Executor::execute_create_table so DESCRIBE can hand it back later.
+    // Left empty when a CreateTableStmt is built by hand (e.g. directly
+    // via Executor in tests) rather than through Database::execute(sql).
+    std::string source_text;
 };
 
 // ─────────────────────────────────────────────
@@ -318,6 +326,21 @@ struct ShowStmt {
 };
 
 // ─────────────────────────────────────────────
+// DESCRIBE statement
+// ─────────────────────────────────────────────
+
+// DESCRIBE table_name
+//
+// Returns the table's schema in two forms: one row per column (Field,
+// Type, Null, Key, Default, Extra — the familiar cross-database layout),
+// plus a final row holding the fully reconstructed CREATE TABLE statement
+// so it can be copied and pasted to recreate the table elsewhere. See
+// Executor::execute_describe.
+struct DescribeStmt {
+    std::string table_name;
+};
+
+// ─────────────────────────────────────────────
 // Top-level statement variant
 // All parse results are returned as a Statement.
 // ─────────────────────────────────────────────
@@ -334,5 +357,6 @@ using Statement = std::variant<
     CreateDatabaseStmt,
     DropDatabaseStmt,
     UseStmt,
-    ShowStmt
+    ShowStmt,
+    DescribeStmt
 >;

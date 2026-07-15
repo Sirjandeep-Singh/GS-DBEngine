@@ -86,10 +86,11 @@ Statement Parser::parse_statement() {
         if (check(TokenType::DATABASE)) return parse_create_database();
         throw std::runtime_error(error_msg("TABLE, INDEX, UNIQUE INDEX, or DATABASE after CREATE"));
     }
-    if (check(TokenType::USE))  return parse_use();
-    if (check(TokenType::SHOW)) return parse_show();
+    if (check(TokenType::USE))      return parse_use();
+    if (check(TokenType::SHOW))     return parse_show();
+    if (check(TokenType::DESCRIBE)) return parse_describe();
 
-    throw std::runtime_error(error_msg("SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, USE, or SHOW"));
+    throw std::runtime_error(error_msg("SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, USE, SHOW, or DESCRIBE"));
 }
 
 // ─────────────────────────────────────────────
@@ -515,6 +516,17 @@ Statement Parser::parse_show() {
         throw std::runtime_error(error_msg("TABLES or DATABASES after SHOW"));
     }
 
+    return stmt;
+}
+
+// ─────────────────────────────────────────────
+// DESCRIBE
+// ─────────────────────────────────────────────
+
+Statement Parser::parse_describe() {
+    expect(TokenType::DESCRIBE, "DESCRIBE");
+    DescribeStmt stmt;
+    stmt.table_name = expect(TokenType::IDENTIFIER, "DESCRIBE table name").value;
     return stmt;
 }
 
