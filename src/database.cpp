@@ -347,6 +347,24 @@ void Database::open_database(const std::string& name)
     current_db_name_ = name;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Checkpointing
+// ─────────────────────────────────────────────────────────────────────────────
+
+void Database::checkpoint_if_needed()
+{
+    if (wal_manager_ && wal_manager_->should_checkpoint()) {
+        wal_manager_->checkpoint();
+    }
+}
+
+void Database::checkpoint_now()
+{
+    if (wal_manager_) {
+        wal_manager_->checkpoint();
+    }
+}
+
 void Database::close_database()
 {
     if (current_db_name_.empty()) {

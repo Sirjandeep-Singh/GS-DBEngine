@@ -173,10 +173,6 @@ private:
     FreeListManager&  free_list_;
     uint32_t          root_page_;
 
-    // minimum number of cells a non-root node must hold before underflowing.
-    // computed at runtime based on max cells per page.
-    uint16_t min_cells_for(NodeType type) const;
-
     // ---- creation / traversal ----
 
     // creates a brand new empty leaf node and makes it the root.

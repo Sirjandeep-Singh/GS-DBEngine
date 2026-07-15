@@ -73,6 +73,15 @@ public:
     bool is_leaf() const;
     bool is_full() const;   // true if no more entries can fit
 
+    // true if the node's byte occupancy has dropped below half of usable
+    // page capacity. Mirrors is_full()'s byte-occupancy approach rather
+    // than counting cells, since entries are variable-length (VARCHAR /
+    // composite keys) and a fixed cell-count threshold can't reflect that.
+    // Used to decide when a node needs redistribution/merge on delete,
+    // and (on a potential donor sibling) whether it can spare an entry
+    // without itself dropping below half full.
+    bool is_underfull() const;
+
     // returns the raw free_space_ptr value — used by BTree to compute
     // exact available space before writing, to prevent overflow
     uint16_t free_space_ptr_value() const;

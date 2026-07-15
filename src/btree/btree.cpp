@@ -51,11 +51,6 @@ void BTree::write_page_through_wal(uint32_t transaction_id, uint32_t page_id, Pa
     wal_.write(transaction_id, page_id, *page);
 }
 
-uint16_t BTree::min_cells_for(NodeType type) const {
-    (void)type;
-    return 1;
-}
-
 uint32_t BTree::leaf_entry_size(const Key& key, const std::vector<uint8_t>& value) {
     return static_cast<uint32_t>(KeyCodec::encode(key).size()) + sizeof(uint32_t) + static_cast<uint32_t>(value.size());
 }
@@ -545,10 +540,10 @@ void BTree::remove(uint32_t transaction_id, const Key& key) {
 
     if (leaf_page_id != root_page_) {
         Page* check_page = buffer_pool_.fetch_page(leaf_page_id);
-        uint16_t cells = BTreeNode(check_page).num_cells();
+        bool underfull = BTreeNode(check_page).is_underfull();
         buffer_pool_.unpin_page(leaf_page_id, false);
 
-        if (cells < min_cells_for(NodeType::LEAF)) {
+        if (underfull) {
             handle_underflow(transaction_id, leaf_page_id, path);
         }
     }
@@ -653,10 +648,10 @@ void BTree::handle_underflow(uint32_t transaction_id, uint32_t page_id, const st
 
     if (parent_page_id != root_page_) {
         Page* parent_page = buffer_pool_.fetch_page(parent_page_id);
-        uint16_t parent_cells = BTreeNode(parent_page).num_cells();
+        bool parent_underfull = BTreeNode(parent_page).is_underfull();
         buffer_pool_.unpin_page(parent_page_id, false);
 
-        if (parent_cells < min_cells_for(NodeType::INTERNAL)) {
+        if (parent_underfull) {
             handle_underflow(transaction_id, parent_page_id, parent_path);
         }
     } else {
@@ -673,10 +668,10 @@ bool BTree::try_redistribute(uint32_t transaction_id, uint32_t page_id, uint32_t
 
     if (siblings.left_sibling != INVALID_PAGE) {
         Page* left_page = buffer_pool_.fetch_page(siblings.left_sibling);
-        uint16_t left_cells = BTreeNode(left_page).num_cells();
+        bool left_can_donate = !BTreeNode(left_page).is_underfull();
         buffer_pool_.unpin_page(siblings.left_sibling, false);
 
-        if (left_cells > min_cells_for(is_leaf ? NodeType::LEAF : NodeType::INTERNAL)) {
+        if (left_can_donate) {
             if (is_leaf) {
                 Page* lp = buffer_pool_.fetch_page(siblings.left_sibling);
                 BTreeNode left_node(lp);
@@ -751,10 +746,10 @@ bool BTree::try_redistribute(uint32_t transaction_id, uint32_t page_id, uint32_t
 
     if (siblings.right_sibling != INVALID_PAGE) {
         Page* right_page = buffer_pool_.fetch_page(siblings.right_sibling);
-        uint16_t right_cells = BTreeNode(right_page).num_cells();
+        bool right_can_donate = !BTreeNode(right_page).is_underfull();
         buffer_pool_.unpin_page(siblings.right_sibling, false);
 
-        if (right_cells > min_cells_for(is_leaf ? NodeType::LEAF : NodeType::INTERNAL)) {
+        if (right_can_donate) {
             if (is_leaf) {
                 Page* rp = buffer_pool_.fetch_page(siblings.right_sibling);
                 BTreeNode right_node(rp);

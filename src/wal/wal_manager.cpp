@@ -7,9 +7,11 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-WALManager::WALManager(const std::string& wal_filename, BufferPool& buffer_pool)
+WALManager::WALManager(const std::string& wal_filename, BufferPool& buffer_pool,
+                        uint64_t checkpoint_threshold_bytes)
     : wal_filename_(wal_filename), wal_fd_(-1),
-      buffer_pool_(buffer_pool), next_transaction_id_(1)
+      buffer_pool_(buffer_pool), next_transaction_id_(1),
+      checkpoint_threshold_bytes_(checkpoint_threshold_bytes)
 {
     wal_fd_ = open(wal_filename.c_str(), O_RDWR | O_CREAT | O_APPEND, 0644);
     if (wal_fd_ < 0) {
@@ -127,6 +129,18 @@ void WALManager::checkpoint() {
     if (lseek(wal_fd_, 0, SEEK_SET) < 0) {
         throw std::runtime_error("WALManager::checkpoint: lseek after truncate failed");
     }
+}
+
+uint64_t WALManager::wal_size() const {
+    struct stat st;
+    if (fstat(wal_fd_, &st) != 0) {
+        throw std::runtime_error("WALManager::wal_size: fstat failed");
+    }
+    return static_cast<uint64_t>(st.st_size);
+}
+
+bool WALManager::should_checkpoint() const {
+    return wal_size() >= checkpoint_threshold_bytes_;
 }
 
 void WALManager::write_bytes(const void* data, size_t size) {

@@ -192,6 +192,43 @@ static bool try_handle_path_command(const std::string& line, Database& db)
     return true;
 }
 
+// Handles the "\checkpoint" meta-command, if 'line' is one.
+//   \checkpoint  — unconditionally flush dirty pages to .db and truncate
+//                  .wal, regardless of its current size. This is on top of
+//                  (not a replacement for) the automatic size-triggered
+//                  checkpoint that already runs after every query via
+//                  Database::checkpoint_if_needed().
+// Returns true if 'line' was a \checkpoint command (handled, whether it
+// succeeded or errored) — false if 'line' isn't one at all, so the caller
+// should fall through to normal SQL buffering.
+static bool try_handle_checkpoint_command(const std::string& line, Database& db)
+{
+    std::string trimmed = line;
+    size_t s = trimmed.find_first_not_of(" \t\r\n");
+    if (s == std::string::npos) return false;
+    trimmed = trimmed.substr(s);
+    size_t e = trimmed.find_last_not_of(" \t\r\n");
+    trimmed = trimmed.substr(0, e + 1);
+
+    std::string lower = trimmed;
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+    if (lower != "\\checkpoint") return false;  // not a \checkpoint command
+
+    if (db.current_database().empty()) {
+        std::cout << "No database selected — nothing to checkpoint.\n";
+        return true;
+    }
+
+    try {
+        db.checkpoint_now();
+        std::cout << "Checkpoint complete.\n";
+    } catch (const std::exception& ex) {
+        std::cerr << "ERROR: " << ex.what() << "\n";
+    }
+
+    return true;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────────────────────────────
@@ -207,6 +244,7 @@ int main()
                   << "Type SQL statements terminated with ';'.\n"
                   << "Type 'exit' or 'quit' to leave.\n"
                   << "Type '\\path' to see/change the data directory.\n"
+                  << "Type '\\checkpoint' to force a WAL checkpoint now.\n"
                   << "Data directory: " << db.data_dir().string() << "\n\n";
     }
 
@@ -250,6 +288,12 @@ int main()
             continue;
         }
 
+        // \checkpoint is likewise a REPL meta-command, not SQL.
+        if (buffer.empty() && try_handle_checkpoint_command(line, db)) {
+            if (interactive) std::cout << '\n';
+            continue;
+        }
+
         // Accumulate the line (preserve newlines for multi-line SQL)
         if (!buffer.empty()) buffer += '\n';
         buffer += line;
@@ -270,6 +314,19 @@ int main()
         }
 
         if (interactive) std::cout << '\n';
+
+        // Flush explicitly: std::cout is only line-buffered/auto-flushed in
+        // some conditions, and checkpoint_if_needed() below can block for a
+        // moment. We want the result the user just read to be guaranteed on
+        // the terminal *before* that possible stall, not sitting in a
+        // buffer behind it.
+        std::cout.flush();
+
+        // Auto-checkpoint check runs after the result is already visible,
+        // so if this query happened to push the WAL past its threshold, the
+        // resulting checkpoint latency lands in the quiet gap before the
+        // next prompt rather than delaying the output above.
+        db.checkpoint_if_needed();
     }
 
     return 0;

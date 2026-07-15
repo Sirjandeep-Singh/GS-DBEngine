@@ -39,10 +39,24 @@ struct WalRecordHeader {
 //
 // Checkpoint:
 //   flush_all() writes dirty buffer pool pages to .db, then truncates .wal
+//
+// Auto-checkpoint:
+//   should_checkpoint() reports whether the .wal file has grown past
+//   checkpoint_threshold_bytes_. This is a pure query — WALManager never
+//   checkpoints itself on size; the caller (Database, driven by the CLI)
+//   decides when it's safe to act on that, e.g. after a query result has
+//   already been printed.
+
+// Default auto-checkpoint threshold — same order of magnitude as SQLite's
+// default (1000 pages / ~4MB). Chosen to bound both worst-case recovery
+// replay time and .wal file size without checkpointing after every tiny
+// statement.
+static const uint64_t DEFAULT_CHECKPOINT_THRESHOLD_BYTES = 4 * 1024 * 1024;
 
 class WALManager {
 public:
-    WALManager(const std::string& wal_filename, BufferPool& buffer_pool);
+    WALManager(const std::string& wal_filename, BufferPool& buffer_pool,
+               uint64_t checkpoint_threshold_bytes = DEFAULT_CHECKPOINT_THRESHOLD_BYTES);
     ~WALManager();
 
     uint32_t begin();
@@ -63,11 +77,26 @@ public:
     // flush_all() writes dirty buffer pool pages to .db, then truncates .wal
     void checkpoint();
 
+    // Current size of the .wal file in bytes (via fstat on wal_fd_).
+    // Pure query — does not itself trigger a checkpoint.
+    uint64_t wal_size() const;
+
+    // True if wal_size() has reached checkpoint_threshold_bytes_. The
+    // caller decides when (or whether) to act on this by calling
+    // checkpoint() explicitly.
+    bool should_checkpoint() const;
+
+    // Reconfigure the auto-checkpoint threshold. Does not itself trigger
+    // a checkpoint, even if the new threshold is already exceeded.
+    void set_checkpoint_threshold(uint64_t bytes) { checkpoint_threshold_bytes_ = bytes; }
+    uint64_t checkpoint_threshold() const { return checkpoint_threshold_bytes_; }
+
 private:
     std::string  wal_filename_;
     int          wal_fd_;
     BufferPool&  buffer_pool_;
     uint32_t     next_transaction_id_;
+    uint64_t     checkpoint_threshold_bytes_;
 
     // pages written in the current active transaction: page_id -> page after-image
     std::unordered_map<uint32_t, Page> active_pages_;

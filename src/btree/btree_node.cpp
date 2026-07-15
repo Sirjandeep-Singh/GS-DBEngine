@@ -236,3 +236,14 @@ bool BTreeNode::is_full() const {    // free space remaining = free_space_ptr - 
     const uint32_t SAFETY_MARGIN = 64;
     return free_space < SAFETY_MARGIN;
 }
+
+bool BTreeNode::is_underfull() const {
+    // used_space = everything below free_space_ptr that isn't header,
+    // i.e. the cells actually written into the page so far.
+    uint32_t used_space = PAGE_SIZE - header()->free_space_ptr;
+    uint32_t capacity   = PAGE_SIZE - NODE_HEADER_SIZE;
+
+    // classic B+tree invariant: a non-root node should stay at least
+    // half full; below that it's a merge/redistribute candidate.
+    return used_space < capacity / 2;
+}

@@ -102,6 +102,23 @@ public:
     // automatically.
     static std::filesystem::path resolve_data_dir();
 
+    // ── Checkpointing ─────────────────────────────────────────────────────────
+
+    // If a database is active and its .wal file has grown past the
+    // auto-checkpoint threshold, checkpoints it (flush + truncate .wal).
+    // No-op (including size check) if no database is active.
+    //
+    // Intended to be called by the CLI *after* a query's result has already
+    // been printed — checkpointing is synchronous and can take a moment, so
+    // running it post-print means that latency lands in the gap before the
+    // next prompt rather than delaying the visible result.
+    void checkpoint_if_needed();
+
+    // Unconditionally checkpoints the active database, regardless of .wal
+    // size. Used by the explicit \checkpoint CLI command. No-op if no
+    // database is active.
+    void checkpoint_now();
+
 private:
     // Fixed location of the persistence file: ~/Documents/GSDB-config.txt.
     // Deliberately NOT inside data_dir_ — it must stay put even when
