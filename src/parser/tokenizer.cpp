@@ -218,6 +218,8 @@ TokenType Tokenizer::keyword_or_identifier(const std::string& word) {
     if (upper == "LIKE")           return TokenType::LIKE;
     if (upper == "ORDER")          return TokenType::ORDER;
     if (upper == "BY")             return TokenType::BY;
+    if (upper == "GROUP")          return TokenType::GROUP;
+    if (upper == "HAVING")         return TokenType::HAVING;
     if (upper == "ASC")            return TokenType::ASC;
     if (upper == "DESC")           return TokenType::DESC;
     if (upper == "LIMIT")          return TokenType::LIMIT;
@@ -231,6 +233,10 @@ TokenType Tokenizer::keyword_or_identifier(const std::string& word) {
     if (upper == "AUTO_INCREMENT") return TokenType::AUTO_INCREMENT;
     if (upper == "CHECK")          return TokenType::CHECK;
     if (upper == "COUNT")          return TokenType::COUNT;
+    if (upper == "MAX")            return TokenType::MAX;
+    if (upper == "MIN")            return TokenType::MIN;
+    if (upper == "AVG")            return TokenType::AVG;
+    if (upper == "MEDIAN")         return TokenType::MEDIAN;
     if (upper == "IN")             return TokenType::IN;
     if (upper == "EXISTS")         return TokenType::EXISTS;
     if (upper == "DEFAULT")        return TokenType::DEFAULT;
@@ -278,6 +284,8 @@ std::string token_type_name(TokenType type) {
         case TokenType::LIKE:            return "LIKE";
         case TokenType::ORDER:           return "ORDER";
         case TokenType::BY:              return "BY";
+        case TokenType::GROUP:           return "GROUP";
+        case TokenType::HAVING:          return "HAVING";
         case TokenType::ASC:             return "ASC";
         case TokenType::DESC:            return "DESC";
         case TokenType::LIMIT:           return "LIMIT";
@@ -291,6 +299,10 @@ std::string token_type_name(TokenType type) {
         case TokenType::AUTO_INCREMENT:  return "AUTO_INCREMENT";
         case TokenType::CHECK:           return "CHECK";
         case TokenType::COUNT:           return "COUNT";
+        case TokenType::MAX:             return "MAX";
+        case TokenType::MIN:             return "MIN";
+        case TokenType::AVG:             return "AVG";
+        case TokenType::MEDIAN:          return "MEDIAN";
         case TokenType::IN:              return "IN";
         case TokenType::EXISTS:          return "EXISTS";
         case TokenType::DEFAULT:         return "DEFAULT";

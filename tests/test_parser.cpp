@@ -151,6 +151,177 @@ void test_select_order_by_desc() {
     std::cout << "[PASS] SELECT * FROM table ORDER BY col DESC\n";
 }
 
+void test_select_max_aggregate() {
+    auto stmt = parse("SELECT MAX(age) FROM users;");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.columns.size() == 1);
+    assert(s.columns[0].aggregate == AggregateType::MAX);
+    assert(s.columns[0].column.column_name == "age");
+
+    std::cout << "[PASS] SELECT MAX(col) FROM table\n";
+}
+
+void test_select_min_aggregate() {
+    auto stmt = parse("SELECT MIN(age) FROM users;");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.columns[0].aggregate == AggregateType::MIN);
+    assert(s.columns[0].column.column_name == "age");
+
+    std::cout << "[PASS] SELECT MIN(col) FROM table\n";
+}
+
+void test_select_avg_aggregate() {
+    auto stmt = parse("SELECT AVG(age) FROM users;");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.columns[0].aggregate == AggregateType::AVG);
+    assert(s.columns[0].column.column_name == "age");
+
+    std::cout << "[PASS] SELECT AVG(col) FROM table\n";
+}
+
+void test_select_median_aggregate() {
+    auto stmt = parse("SELECT MEDIAN(age) FROM users;");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.columns[0].aggregate == AggregateType::MEDIAN);
+    assert(s.columns[0].column.column_name == "age");
+
+    std::cout << "[PASS] SELECT MEDIAN(col) FROM table\n";
+}
+
+void test_select_group_by_with_multiple_aggregates() {
+    auto stmt = parse("SELECT dept, MAX(age), MIN(age), AVG(age), MEDIAN(age) "
+                       "FROM users GROUP BY dept;");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.columns.size() == 5);
+    assert(s.columns[0].aggregate == AggregateType::NONE);
+    assert(s.columns[1].aggregate == AggregateType::MAX);
+    assert(s.columns[2].aggregate == AggregateType::MIN);
+    assert(s.columns[3].aggregate == AggregateType::AVG);
+    assert(s.columns[4].aggregate == AggregateType::MEDIAN);
+    assert(s.group_by.size() == 1);
+    assert(s.group_by[0].column_name == "dept");
+
+    std::cout << "[PASS] SELECT with multiple aggregate functions and GROUP BY\n";
+}
+
+void test_select_having_absent_by_default() {
+    auto stmt = parse("SELECT dept, COUNT(*) FROM people GROUP BY dept;");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.having == nullptr);
+
+    std::cout << "[PASS] SelectStmt.having is null when no HAVING clause is given\n";
+}
+
+void test_select_having_aggregate_compare() {
+    auto stmt = parse("SELECT dept, COUNT(*) FROM people GROUP BY dept HAVING COUNT(*) > 5;");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.having != nullptr);
+    assert(s.having->kind == HavingExpr::Kind::COMPARE);
+    assert(s.having->compare.operand.aggregate == AggregateType::COUNT_STAR);
+    assert(s.having->compare.op == CompareOp::GT);
+    assert(std::get<int32_t>(s.having->compare.value) == 5);
+
+    std::cout << "[PASS] HAVING COUNT(*) > 5 parses to a COMPARE node\n";
+}
+
+void test_select_having_plain_column_compare() {
+    // HAVING's left-hand side isn't limited to aggregates — a plain
+    // grouped column works too (parse_aggregate_or_column falls back to
+    // a bare column reference).
+    auto stmt = parse("SELECT dept FROM people GROUP BY dept HAVING dept = 'eng';");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.having->compare.operand.aggregate == AggregateType::NONE);
+    assert(s.having->compare.operand.column.column_name == "dept");
+    assert(s.having->compare.op == CompareOp::EQ);
+    assert(std::get<std::string>(s.having->compare.value) == "eng");
+
+    std::cout << "[PASS] HAVING on a plain grouped column parses correctly\n";
+}
+
+void test_select_having_and_logical() {
+    auto stmt = parse(
+        "SELECT dept, COUNT(*), AVG(age) FROM people GROUP BY dept "
+        "HAVING COUNT(*) > 2 AND AVG(age) < 30;");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.having->kind == HavingExpr::Kind::LOGICAL);
+    assert(s.having->logical_op == LogicalOp::AND);
+    assert(s.having->left->compare.operand.aggregate == AggregateType::COUNT_STAR);
+    assert(s.having->right->compare.operand.aggregate == AggregateType::AVG);
+
+    std::cout << "[PASS] HAVING <cond> AND <cond> parses to a LOGICAL/AND node\n";
+}
+
+void test_select_having_composes_with_order_by_and_limit() {
+    auto stmt = parse(
+        "SELECT dept, COUNT(*) FROM people GROUP BY dept "
+        "HAVING COUNT(*) > 1 ORDER BY dept LIMIT 3;");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.having != nullptr);
+    assert(s.order_by.size() == 1);
+    assert(s.limit.has_value());
+    assert(s.limit.value() == 3);
+
+    std::cout << "[PASS] HAVING composes with a following ORDER BY and LIMIT\n";
+}
+
+void test_select_group_by_single_column() {
+    auto stmt = parse("SELECT dept, COUNT(*) FROM people GROUP BY dept;");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.group_by.size() == 1);
+    assert(s.group_by[0].column_name == "dept");
+    assert(s.columns.size() == 2);
+    assert(s.columns[0].column.column_name == "dept");
+    assert(s.columns[1].aggregate == AggregateType::COUNT_STAR);
+
+    std::cout << "[PASS] SELECT col, COUNT(*) FROM table GROUP BY col\n";
+}
+
+void test_select_group_by_multiple_columns() {
+    auto stmt = parse("SELECT dept, age FROM people GROUP BY dept, age;");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.group_by.size() == 2);
+    assert(s.group_by[0].column_name == "dept");
+    assert(s.group_by[1].column_name == "age");
+
+    std::cout << "[PASS] GROUP BY col1, col2 parses a comma-separated column list\n";
+}
+
+void test_select_group_by_absent_by_default() {
+    auto stmt = parse("SELECT * FROM users;");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.group_by.empty());
+
+    std::cout << "[PASS] SelectStmt.group_by is empty when no GROUP BY clause is given\n";
+}
+
+void test_select_group_by_then_order_by_and_limit() {
+    // GROUP BY must be parsed before ORDER BY/LIMIT in clause order.
+    auto stmt = parse("SELECT dept, COUNT(*) FROM people GROUP BY dept ORDER BY dept LIMIT 5;");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.group_by.size() == 1);
+    assert(s.group_by[0].column_name == "dept");
+    assert(s.order_by.size() == 1);
+    assert(s.order_by[0].column.column_name == "dept");
+    assert(s.limit.has_value());
+    assert(s.limit.value() == 5);
+
+    std::cout << "[PASS] GROUP BY composes with a following ORDER BY and LIMIT\n";
+}
+
 void test_select_limit() {
     auto stmt = parse("SELECT * FROM users LIMIT 10;");
     auto& s = std::get<SelectStmt>(stmt);
@@ -618,6 +789,20 @@ int main() {
     test_select_where_is_not_null();
     test_select_order_by_asc();
     test_select_order_by_desc();
+    test_select_max_aggregate();
+    test_select_min_aggregate();
+    test_select_avg_aggregate();
+    test_select_median_aggregate();
+    test_select_group_by_single_column();
+    test_select_group_by_multiple_columns();
+    test_select_group_by_absent_by_default();
+    test_select_group_by_then_order_by_and_limit();
+    test_select_group_by_with_multiple_aggregates();
+    test_select_having_absent_by_default();
+    test_select_having_aggregate_compare();
+    test_select_having_plain_column_compare();
+    test_select_having_and_logical();
+    test_select_having_composes_with_order_by_and_limit();
     test_select_limit();
     test_select_inner_join();
     test_select_left_join();

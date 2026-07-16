@@ -15,3 +15,4 @@
 - [ ] Multi-statement transactions (BEGIN / COMMIT / ROLLBACK) - not important YET
 - [ ] Query Planner
 - [ ] MVCC
+- [ ] add a timer for queries.

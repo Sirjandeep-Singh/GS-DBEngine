@@ -13,7 +13,7 @@
 // Throws std::runtime_error with a descriptive message on any syntax error.
 //
 // Supported statements:
-//   SELECT ... FROM ... [JOIN ...] [WHERE ...] [ORDER BY ...] [LIMIT n]
+//   SELECT ... FROM ... [JOIN ...] [WHERE ...] [GROUP BY ...] [HAVING ...] [ORDER BY ...] [LIMIT n]
 //   INSERT INTO table [(cols)] VALUES (vals)
 //   UPDATE table SET col=val [, ...] [WHERE ...]
 //   DELETE FROM table [WHERE ...]
@@ -104,6 +104,28 @@ private:
 
     // parses ORDER BY col [ASC|DESC] [, ...]
     std::vector<OrderByClause> parse_order_by();
+
+    // parses GROUP BY col [, col ...]
+    std::vector<ColumnRef> parse_group_by();
+
+    // parses HAVING expr — returns nullptr if no HAVING keyword
+    HavingExprPtr    parse_having();
+
+    // parses a HAVING expression tree respecting AND/OR precedence —
+    // structurally identical to the parse_or_expr/parse_and_expr/
+    // parse_not_expr chain above, just building HavingExpr nodes instead
+    // of WhereExpr ones.
+    HavingExprPtr    parse_having_or_expr();
+    HavingExprPtr    parse_having_and_expr();
+    HavingExprPtr    parse_having_not_expr();
+    HavingExprPtr    parse_having_compare_expr();
+
+    // parses a COUNT(*)/COUNT(col)/MAX(col)/MIN(col)/AVG(col)/MEDIAN(col)
+    // call, or falls back to a plain column reference. Shared by
+    // parse_select_columns (the SELECT list) and parse_having_compare_expr
+    // (HAVING's left-hand side) — both need exactly this "aggregate or
+    // column" shape, just packaged differently (SelectColumn either way).
+    SelectColumn     parse_aggregate_or_column();
 
     // parses a JOIN clause — called repeatedly for multiple JOINs
     JoinClause       parse_join();

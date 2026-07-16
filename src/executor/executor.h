@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <optional>
 #include <memory>
+#include <utility>
 
 #include "../parser/ast.h"
 #include "../catalog/catalog_manager.h"
@@ -275,12 +276,73 @@ private:
 
     QueryResult execute_select(const SelectStmt& stmt);
 
-    // Handles SELECT lists where every column is an aggregate (COUNT(*) /
-    // COUNT(col)) — a single-row result computed over a WHERE-filtered scan.
-    // v1 scope: no JOIN, no GROUP BY (see AggregateType comment in ast.h).
+    // Handles SELECT lists where every column is an aggregate (COUNT/MAX/
+    // MIN/AVG/MEDIAN) and there's no GROUP BY — a single-row result
+    // computed over a WHERE-filtered scan. v1 scope: no JOIN.
     QueryResult execute_select_aggregate(const SelectStmt&  stmt,
                                           const TableSchema& schema,
                                           Table&              tbl) const;
+
+    // Handles SELECT ... GROUP BY — one result row per distinct combination
+    // of GROUP BY column values. Every plain SELECT column must also be a
+    // GROUP BY column (validated here, not by the parser); aggregate
+    // columns (COUNT/MAX/MIN/AVG/MEDIAN) are computed per group via
+    // compute_aggregate_column. An optional HAVING clause filters groups
+    // after they're built (see evaluate_having) and before LIMIT is
+    // applied. v1 scope: no JOIN, no ORDER BY (ORDER BY on a grouped/
+    // aggregate result needs to sort the projected output rather than a
+    // schema-indexed Row, which the existing sort_by_column helper in
+    // execute_select doesn't support yet).
+    QueryResult execute_select_group_by(const SelectStmt&  stmt,
+                                         const TableSchema& schema,
+                                         Table&              tbl) const;
+
+    // Computes one aggregate SELECT column's header text and string value
+    // over `rows` — either the whole WHERE-filtered scan (execute_select_
+    // aggregate) or a single group's rows (execute_select_group_by).
+    // COUNT_STAR/COUNT_COLUMN count rows/non-NULLs; MAX/MIN compare via
+    // value_less_than (same cross-int/float ordering WHERE and ORDER BY
+    // use); AVG/MEDIAN require a numeric column and always report a FLOAT
+    // result, even over an all-INT column. Any aggregate over zero
+    // non-NULL values reports NULL (COUNT reports 0, matching real SQL).
+    // Thin formatting wrapper around compute_aggregate_value.
+    std::pair<std::string, std::string> compute_aggregate_column(
+        const SelectColumn&             sc,
+        const std::vector<ScanResult>&  rows,
+        const TableSchema&              schema,
+        const std::string&              alias) const;
+
+    // Same computation as compute_aggregate_column, minus the string
+    // formatting — returns the raw Value (monostate for NULL) so callers
+    // that need to compare or further compute with the result, rather than
+    // display it, don't have to parse a string back out. Used by
+    // compute_aggregate_column itself and by evaluate_having (HAVING needs
+    // the actual value to run compare_values against a literal).
+    Value compute_aggregate_value(
+        const SelectColumn&             sc,
+        const std::vector<ScanResult>&  rows,
+        const TableSchema&              schema,
+        const std::string&              alias) const;
+
+    // Returns the display header for an aggregate SELECT column, e.g.
+    // "COUNT(*)", "MAX(age)". Single source of truth for aggregate header
+    // text — used both by compute_aggregate_column and by
+    // execute_select_group_by's own header-building pass (which needs
+    // headers before any group's rows are available to compute a value).
+    static std::string aggregate_header_label(AggregateType      type,
+                                               const std::string& col_name);
+
+    // Evaluates a HAVING expression against one group's rows (post-WHERE,
+    // pre-projection) — true if the group passes. Mirrors evaluate_where's
+    // COMPARE/LOGICAL recursion, but the COMPARE operand is computed via
+    // compute_aggregate_value (which handles both aggregate and plain
+    // grouped-column operands) instead of a direct row lookup, and the
+    // actual comparison reuses the same compare_values helper evaluate_
+    // where's evaluate_compare does — see executor.cpp.
+    bool evaluate_having(const HavingExprPtr&            expr,
+                          const std::vector<ScanResult>&  group_rows,
+                          const TableSchema&               schema,
+                          const std::string&               alias) const;
     QueryResult execute_insert(const InsertStmt& stmt);
     QueryResult execute_update(const UpdateStmt& stmt);
     QueryResult execute_delete(const DeleteStmt& stmt);

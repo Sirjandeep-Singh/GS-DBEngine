@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -53,6 +54,75 @@ static bool value_matches_type(const Value& v, ColumnType col_type)
         case ColumnType::VARCHAR: return std::holds_alternative<std::string>(v);
     }
     return false;
+}
+
+// General non-NULL value comparison for a CompareOp — same-type compares
+// directly, INT/FLOAT cross-compares via float promotion, anything else
+// (incompatible types) is false. Callers are responsible for handling NULL
+// operands themselves (SQL semantics for that vary by context — a WHERE
+// comparison against NULL is always false, but IS NULL/IS NOT NULL check
+// for NULL directly rather than calling this at all). Shared by
+// evaluate_compare (WHERE) and evaluate_having (HAVING) so the two clauses
+// can't silently drift apart on what "=" or ">" means.
+static bool compare_values(const Value& lhs, CompareOp op, const Value& rhs) {
+    return std::visit([&](const auto& l, const auto& r) -> bool {
+        using L = std::decay_t<decltype(l)>;
+        using R = std::decay_t<decltype(r)>;
+
+        if constexpr (std::is_same_v<L, std::monostate> ||
+                      std::is_same_v<R, std::monostate>) {
+            return false;
+        } else if constexpr ((std::is_same_v<L, int32_t> || std::is_same_v<L, float>) &&
+                              (std::is_same_v<R, int32_t> || std::is_same_v<R, float>) &&
+                              !std::is_same_v<L, R>) {
+            float fl = static_cast<float>(l);
+            float fr = static_cast<float>(r);
+            switch (op) {
+                case CompareOp::EQ:  return fl == fr;
+                case CompareOp::NEQ: return fl != fr;
+                case CompareOp::LT:  return fl <  fr;
+                case CompareOp::GT:  return fl >  fr;
+                case CompareOp::LTE: return fl <= fr;
+                case CompareOp::GTE: return fl >= fr;
+                default: return false;
+            }
+        } else if constexpr (std::is_same_v<L, R>) {
+            switch (op) {
+                case CompareOp::EQ:  return l == r;
+                case CompareOp::NEQ: return l != r;
+                case CompareOp::LT:  return l <  r;
+                case CompareOp::GT:  return l >  r;
+                case CompareOp::LTE: return l <= r;
+                case CompareOp::GTE: return l >= r;
+                default: return false;
+            }
+        } else {
+            return false;  // incompatible types (e.g. INT vs VARCHAR)
+        }
+    }, lhs, rhs);
+}
+
+// Non-NULL comparison used both by ORDER BY (execute_select's
+// sort_by_column) and MAX/MIN aggregates (compute_aggregate_column): same
+// type compares directly; INT vs FLOAT compares via a float promotion;
+// anything else (e.g. comparing a VARCHAR to an INT, which schema
+// validation should never actually allow through) is arbitrarily false.
+// Callers are responsible for skipping NULLs before calling this — it has
+// no NULL-ordering opinion of its own.
+static bool value_less_than(const Value& va, const Value& vb) {
+    return std::visit(
+        [](const auto& x, const auto& y) -> bool {
+            using X = std::decay_t<decltype(x)>;
+            using Y = std::decay_t<decltype(y)>;
+            if constexpr (std::is_same_v<X, Y> && !std::is_same_v<X, std::monostate>) {
+                return x < y;
+            }
+            if constexpr ((std::is_same_v<X, int32_t> || std::is_same_v<X, float>) &&
+                          (std::is_same_v<Y, int32_t> || std::is_same_v<Y, float>)) {
+                return static_cast<float>(x) < static_cast<float>(y);
+            }
+            return false;
+        }, va, vb);
 }
 
 // Coerces a WHERE literal to the type an indexed column actually stores,
@@ -1102,8 +1172,24 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
     const TableSchema& schema = catalog_.get_table(stmt.table_name);
     Table left_tbl(schema, buffer_pool_, wal_, free_list_);
 
-    // ── Aggregate (COUNT) queries ───────────────────────────────────────────
-    // No GROUP BY yet, so the only meaningful case is: every column in the
+    // HAVING without GROUP BY: real SQL treats the whole result as one
+    // implicit group, but that's out of scope here for now. Checked here,
+    // before either branch below, so it's never silently ignored by the
+    // no-GROUP-BY aggregate path (which has no HAVING handling of its own).
+    if (stmt.having && stmt.group_by.empty()) {
+        return {false, "SELECT: HAVING requires GROUP BY"};
+    }
+
+    // ── GROUP BY ─────────────────────────────────────────────────────────────
+    // Handled entirely separately from the no-GROUP-BY aggregate path below:
+    // it has its own validation (plain columns must be GROUP BY columns,
+    // not "every column is an aggregate") and its own row-bucketing logic.
+    if (!stmt.group_by.empty()) {
+        return execute_select_group_by(stmt, schema, left_tbl);
+    }
+
+    // ── Aggregate (COUNT) queries, no GROUP BY ──────────────────────────────
+    // Without GROUP BY, the only meaningful case is: every column in the
     // SELECT list is an aggregate (mixing aggregate + plain columns without
     // GROUP BY is what real SQL engines reject too — GROUP BY is exactly
     // what makes that combination well-defined).
@@ -1145,24 +1231,7 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
                 if (a_null)           return false; // a (NULL) goes after b
                 if (b_null)           return true;  // b (NULL) goes after a
 
-                bool less_than = std::visit(
-                    [](const auto& x, const auto& y) -> bool {
-                        using X = std::decay_t<decltype(x)>;
-                        using Y = std::decay_t<decltype(y)>;
-                        // Same-type comparison
-                        if constexpr (std::is_same_v<X, Y> &&
-                                      !std::is_same_v<X, std::monostate>) {
-                            return x < y;
-                        }
-                        // Cross int/float comparison
-                        if constexpr ((std::is_same_v<X, int32_t> ||
-                                       std::is_same_v<X, float>) &&
-                                      (std::is_same_v<Y, int32_t> ||
-                                       std::is_same_v<Y, float>)) {
-                            return static_cast<float>(x) < static_cast<float>(y);
-                        }
-                        return false;
-                    }, va, vb);
+                bool less_than = value_less_than(va, vb);
 
                 return ascending ? less_than : !less_than;
             });
@@ -1277,22 +1346,237 @@ QueryResult Executor::execute_select_aggregate(const SelectStmt&  stmt,
     row_out.reserve(stmt.columns.size());
 
     for (const auto& sc : stmt.columns) {
-        if (sc.aggregate == AggregateType::COUNT_STAR) {
-            result.columns.push_back("COUNT(*)");
-            row_out.push_back(std::to_string(rows.size()));
-        } else {
-            // COUNT(column) — count only non-NULL values at this column
-            size_t   idx   = resolve_column(sc.column, schema, stmt.table_alias);  // throws on unknown column
-            uint32_t count = 0;
-            for (const auto& sr : rows) {
-                if (!is_null(sr.row.get(idx))) count++;
-            }
-            result.columns.push_back("COUNT(" + sc.column.column_name + ")");
-            row_out.push_back(std::to_string(count));
-        }
+        auto [header, value] = compute_aggregate_column(sc, rows, schema, stmt.table_alias);
+        result.columns.push_back(std::move(header));
+        row_out.push_back(std::move(value));
     }
 
     result.rows.push_back(std::move(row_out));
+    return result;
+}
+
+std::string Executor::aggregate_header_label(AggregateType type, const std::string& col_name) {
+    switch (type) {
+        case AggregateType::COUNT_STAR:   return "COUNT(*)";
+        case AggregateType::COUNT_COLUMN: return "COUNT(" + col_name + ")";
+        case AggregateType::MAX:          return "MAX("   + col_name + ")";
+        case AggregateType::MIN:          return "MIN("   + col_name + ")";
+        case AggregateType::AVG:          return "AVG("   + col_name + ")";
+        case AggregateType::MEDIAN:       return "MEDIAN(" + col_name + ")";
+        case AggregateType::NONE:         return col_name;
+    }
+    return col_name;  // unreachable — silences -Wreturn-type on some compilers
+}
+
+std::pair<std::string, std::string> Executor::compute_aggregate_column(
+    const SelectColumn&            sc,
+    const std::vector<ScanResult>& rows,
+    const TableSchema&              schema,
+    const std::string&              alias) const
+{
+    const std::string header = aggregate_header_label(sc.aggregate, sc.column.column_name);
+    const Value        value  = compute_aggregate_value(sc, rows, schema, alias);
+    return {header, is_null(value) ? "NULL" : value_to_string(value)};
+}
+
+Value Executor::compute_aggregate_value(
+    const SelectColumn&            sc,
+    const std::vector<ScanResult>& rows,
+    const TableSchema&              schema,
+    const std::string&              alias) const
+{
+    if (sc.aggregate == AggregateType::COUNT_STAR) {
+        return static_cast<int32_t>(rows.size());
+    }
+
+    // Every remaining case reads a specific column, so resolve it once.
+    size_t idx = resolve_column(sc.column, schema, alias);  // throws on unknown column
+
+    if (sc.aggregate == AggregateType::NONE) {
+        // A plain grouped column — e.g. HAVING's left-hand side doesn't
+        // have to be an aggregate ("HAVING dept = 'eng'" is valid, and
+        // parse_aggregate_or_column allows it). Every row in a group
+        // shares the same value for a GROUP BY column by construction, so
+        // any row's value works; the first is as good as any.
+        return rows.empty() ? Value{std::monostate{}} : rows.front().row.get(idx);
+    }
+
+    if (sc.aggregate == AggregateType::COUNT_COLUMN) {
+        // Count only non-NULL values at this column.
+        int32_t count = 0;
+        for (const auto& sr : rows) {
+            if (!is_null(sr.row.get(idx))) count++;
+        }
+        return count;
+    }
+
+    if (sc.aggregate == AggregateType::MAX || sc.aggregate == AggregateType::MIN) {
+        // Any orderable type (INT/FLOAT cross-compared, or same-type
+        // string/bool) works here — reuses the same value_less_than
+        // ordering ORDER BY already relies on. NULLs are skipped entirely
+        // rather than participating in the comparison.
+        const Value* best = nullptr;
+        for (const auto& sr : rows) {
+            const Value& v = sr.row.get(idx);
+            if (is_null(v)) continue;
+            if (!best) { best = &v; continue; }
+            if (sc.aggregate == AggregateType::MAX) {
+                if (value_less_than(*best, v)) best = &v;
+            } else {
+                if (value_less_than(v, *best)) best = &v;
+            }
+        }
+        return best ? *best : Value{std::monostate{}};
+    }
+
+    // AVG / MEDIAN — numeric-only (INT or FLOAT), always reported as
+    // FLOAT even when every contributing value was an INT, so the result
+    // type doesn't depend on which values happened to be in the group.
+    std::vector<float> nums;
+    nums.reserve(rows.size());
+    for (const auto& sr : rows) {
+        const Value& v = sr.row.get(idx);
+        if (is_null(v)) continue;
+        if (std::holds_alternative<int32_t>(v)) {
+            nums.push_back(static_cast<float>(get_int(v)));
+        } else if (std::holds_alternative<float>(v)) {
+            nums.push_back(get_float(v));
+        } else {
+            throw std::runtime_error(
+                aggregate_header_label(sc.aggregate, sc.column.column_name) +
+                ": column '" + sc.column.column_name + "' is not numeric");
+        }
+    }
+
+    if (nums.empty()) return Value{std::monostate{}};
+
+    if (sc.aggregate == AggregateType::AVG) {
+        double sum = 0.0;
+        for (float f : nums) sum += f;
+        return Value(static_cast<float>(sum / nums.size()));
+    }
+
+    // MEDIAN — sort and take the middle value (average the two middle
+    // values for an even-sized group).
+    std::sort(nums.begin(), nums.end());
+    size_t n = nums.size();
+    float  median = (n % 2 == 1) ? nums[n / 2]
+                                  : (nums[n / 2 - 1] + nums[n / 2]) / 2.0f;
+    return Value(median);
+}
+
+QueryResult Executor::execute_select_group_by(const SelectStmt&  stmt,
+                                               const TableSchema& schema,
+                                               Table&              tbl) const
+{
+    // v1 scope restrictions — mirror execute_select_aggregate's own
+    // restrictions where the same reasoning applies.
+    if (!stmt.joins.empty()) {
+        return {false, "SELECT: GROUP BY is not yet supported with JOIN"};
+    }
+    if (!stmt.order_by.empty()) {
+        return {false, "SELECT: ORDER BY is not yet supported together with GROUP BY"};
+    }
+    if (stmt.having && stmt.group_by.empty()) {
+        // Real SQL allows HAVING without GROUP BY (the whole result set is
+        // treated as a single group) — out of scope here for now, so this
+        // is a clear rejection rather than a silent misinterpretation.
+        // Unreachable in practice today since execute_select only calls
+        // this function when group_by is non-empty, but kept as a direct
+        // check rather than relying on that caller invariant.
+        return {false, "SELECT: HAVING requires GROUP BY"};
+    }
+
+    // Every plain (non-aggregate, non-literal) SELECT column must also be a
+    // GROUP BY column — the standard SQL rule that makes "one output row
+    // per group" well-defined. SELECT * is rejected outright for now (a
+    // star's meaning under GROUP BY is ambiguous without knowing the full
+    // column list up front, and no query in this codebase needs it yet).
+    for (const auto& sc : stmt.columns) {
+        if (sc.is_star) {
+            return {false, "SELECT: * is not yet supported with GROUP BY"};
+        }
+        if (sc.is_literal || sc.aggregate != AggregateType::NONE) continue;
+
+        bool in_group_by = false;
+        for (const auto& gb : stmt.group_by) {
+            if (gb.column_name == sc.column.column_name) { in_group_by = true; break; }
+        }
+        if (!in_group_by) {
+            return {false, "SELECT: column '" + sc.column.column_name +
+                           "' must appear in GROUP BY or be used inside an aggregate function"};
+        }
+    }
+
+    Predicate pred = build_predicate(stmt.where, schema, nullptr, nullptr, stmt.table_alias);
+    std::vector<ScanResult> rows = scan_with_index(tbl, schema, stmt.where, pred, stmt.table_alias);
+
+    // Resolve GROUP BY column indices once, up front.
+    std::vector<size_t> group_col_idx;
+    group_col_idx.reserve(stmt.group_by.size());
+    for (const auto& gb : stmt.group_by) {
+        group_col_idx.push_back(resolve_column(gb, schema, stmt.table_alias));  // throws on unknown column
+    }
+
+    // Bucket rows by their GROUP BY key. std::map's default ordering on
+    // std::vector<Value> — lexicographic, using Value's own variant
+    // ordering — is enough here; no custom comparator needed. In
+    // particular this treats NULL (monostate) as equal to NULL for
+    // grouping purposes, which is what SQL expects even though NULL never
+    // equals NULL in a WHERE comparison — see evaluate_where for that
+    // (deliberately different) NULL handling.
+    std::map<std::vector<Value>, std::vector<ScanResult>> groups;
+    for (auto& sr : rows) {
+        std::vector<Value> key;
+        key.reserve(group_col_idx.size());
+        for (size_t idx : group_col_idx) key.push_back(sr.row.get(idx));
+        groups[std::move(key)].push_back(sr);
+    }
+
+    QueryResult result;
+    result.success = true;
+    result.columns.reserve(stmt.columns.size());
+    for (const auto& sc : stmt.columns) {
+        if (sc.is_literal) {
+            result.columns.push_back(value_to_string(sc.literal));
+        } else if (sc.aggregate != AggregateType::NONE) {
+            result.columns.push_back(aggregate_header_label(sc.aggregate, sc.column.column_name));
+        } else {
+            result.columns.push_back(sc.column.column_name);
+        }
+    }
+
+    // Iteration order follows std::map's key ordering (sorted ascending by
+    // GROUP BY column values) — deterministic, though not something a
+    // caller should rely on as "the" order without an explicit ORDER BY
+    // once that's supported here.
+    for (const auto& [key, group_rows] : groups) {
+        if (stmt.having && !evaluate_having(stmt.having, group_rows, schema, stmt.table_alias)) {
+            continue;
+        }
+
+        std::vector<std::string> row_out;
+        row_out.reserve(stmt.columns.size());
+        for (const auto& sc : stmt.columns) {
+            if (sc.is_literal) {
+                row_out.push_back(value_to_string(sc.literal));
+            } else if (sc.aggregate != AggregateType::NONE) {
+                auto [header, value] = compute_aggregate_column(sc, group_rows, schema, stmt.table_alias);
+                row_out.push_back(std::move(value));
+            } else {
+                size_t idx = resolve_column(sc.column, schema, stmt.table_alias);
+                row_out.push_back(value_to_string(group_rows.front().row.get(idx)));
+            }
+        }
+        result.rows.push_back(std::move(row_out));
+    }
+
+    // LIMIT — applies to the number of output groups.
+    if (stmt.limit.has_value()) {
+        size_t lim = static_cast<size_t>(stmt.limit.value());
+        if (result.rows.size() > lim) result.rows.resize(lim);
+    }
+
     return result;
 }
 
@@ -1859,52 +2143,42 @@ bool Executor::evaluate_compare(const CompareExpr&   expr,
         return like_match(get_string(val), get_string(rhs));
     }
 
-    // General comparison via std::visit — handles same-type and int/float cross comparisons
-    return std::visit([&](const auto& lhs, const auto& rhs_val) -> bool {
-        using L = std::decay_t<decltype(lhs)>;
-        using R = std::decay_t<decltype(rhs_val)>;
+    // General comparison — handles same-type and int/float cross comparisons
+    return compare_values(val, expr.op, rhs);
+}
 
-        // monostate (NULL) was already filtered above, but guard anyway
-        if constexpr (std::is_same_v<L, std::monostate> ||
-                      std::is_same_v<R, std::monostate>) {
-            return false;
-        }
+bool Executor::evaluate_having(const HavingExprPtr&           expr,
+                                const std::vector<ScanResult>& group_rows,
+                                const TableSchema&              schema,
+                                const std::string&               alias) const
+{
+    if (!expr) return true;
 
-        // Int/float cross comparison — promote both to float
-        else if constexpr ((std::is_same_v<L, int32_t> || std::is_same_v<L, float>) &&
-                           (std::is_same_v<R, int32_t> || std::is_same_v<R, float>) &&
-                           !std::is_same_v<L, R>) {
-            float fl = static_cast<float>(lhs);
-            float fr = static_cast<float>(rhs_val);
-            switch (expr.op) {
-                case CompareOp::EQ:  return fl == fr;
-                case CompareOp::NEQ: return fl != fr;
-                case CompareOp::LT:  return fl <  fr;
-                case CompareOp::GT:  return fl >  fr;
-                case CompareOp::LTE: return fl <= fr;
-                case CompareOp::GTE: return fl >= fr;
-                default: return false;
-            }
-        }
+    if (expr->kind == HavingExpr::Kind::COMPARE) {
+        const HavingCompareExpr& c = expr->compare;
+        Value lhs = compute_aggregate_value(c.operand, group_rows, schema, alias);
 
-        // Same-type comparison
-        else if constexpr (std::is_same_v<L, R>) {
-            switch (expr.op) {
-                case CompareOp::EQ:  return lhs == rhs_val;
-                case CompareOp::NEQ: return lhs != rhs_val;
-                case CompareOp::LT:  return lhs <  rhs_val;
-                case CompareOp::GT:  return lhs >  rhs_val;
-                case CompareOp::LTE: return lhs <= rhs_val;
-                case CompareOp::GTE: return lhs >= rhs_val;
-                default: return false;
-            }
-        }
+        // SQL NULL semantics: any comparison with NULL yields false — same
+        // rule evaluate_compare applies for WHERE (a group whose aggregate
+        // came back NULL, e.g. AVG over an empty/all-NULL group, doesn't
+        // satisfy any HAVING comparison against it).
+        if (is_null(lhs)) return false;
 
-        // Incompatible types (e.g. comparing INT with VARCHAR)
-        else {
-            return false;
-        }
-    }, val, rhs);
+        return compare_values(lhs, c.op, c.value);
+    }
+
+    // LOGICAL node — identical shape to evaluate_where's LOGICAL handling
+    switch (expr->logical_op) {
+        case LogicalOp::AND:
+            return evaluate_having(expr->left,  group_rows, schema, alias) &&
+                   evaluate_having(expr->right, group_rows, schema, alias);
+        case LogicalOp::OR:
+            return evaluate_having(expr->left,  group_rows, schema, alias) ||
+                   evaluate_having(expr->right, group_rows, schema, alias);
+        case LogicalOp::NOT:
+            return !evaluate_having(expr->left, group_rows, schema, alias);
+    }
+    return false;
 }
 
 Predicate Executor::build_predicate(const WhereExprPtr& where,

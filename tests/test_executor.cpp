@@ -1273,6 +1273,353 @@ void test_select_count_aggregate_uses_index() {
     cleanup();
 }
 
+// Skewed on purpose (one outlier: 100) so AVG and MEDIAN land on visibly
+// different values — a symmetric fixture could pass even if MEDIAN were
+// accidentally implemented as a copy of AVG.
+static void seed_skewed_values(Env& env) {
+    exec(env, "CREATE TABLE t (id INT PRIMARY KEY, grp VARCHAR(10), val INT);");
+    exec(env, "INSERT INTO t VALUES (1, 'a', 1);");
+    exec(env, "INSERT INTO t VALUES (2, 'a', 2);");
+    exec(env, "INSERT INTO t VALUES (3, 'a', 3);");
+    exec(env, "INSERT INTO t VALUES (4, 'a', 4);");
+    exec(env, "INSERT INTO t VALUES (5, 'a', 100);");
+    exec(env, "INSERT INTO t VALUES (6, 'b', 10);");
+    exec(env, "INSERT INTO t VALUES (7, 'b', 20);");
+    exec(env, "INSERT INTO t VALUES (8, 'b', 30);");
+}
+
+void test_select_max_min_avg_median_whole_table() {
+    cleanup();
+    Env env;
+    seed_skewed_values(env);
+
+    auto r = exec(env, "SELECT MAX(val), MIN(val), AVG(val), MEDIAN(val) FROM t WHERE grp = 'a';");
+    assert(r.success);
+    assert(r.columns[0] == "MAX(val)");
+    assert(r.columns[1] == "MIN(val)");
+    assert(r.columns[2] == "AVG(val)");
+    assert(r.columns[3] == "MEDIAN(val)");
+    assert(r.rows[0][0] == "100");
+    assert(r.rows[0][1] == "1");
+    assert(r.rows[0][2] == "22.000000");  // (1+2+3+4+100)/5
+    assert(r.rows[0][3] == "3.000000");   // sorted 1,2,3,4,100 -> middle value
+
+    std::cout << "[PASS] MAX/MIN/AVG/MEDIAN over the whole (WHERE-filtered) table\n";
+    cleanup();
+}
+
+void test_select_group_by_max_min_avg_median() {
+    cleanup();
+    Env env;
+    seed_skewed_values(env);
+
+    auto r = exec(env,
+        "SELECT grp, MAX(val), MIN(val), AVG(val), MEDIAN(val) FROM t GROUP BY grp;");
+    assert(r.success);
+    assert(r.rows.size() == 2);
+
+    // group 'a': 1, 2, 3, 4, 100
+    assert(r.rows[0][0] == "a");
+    assert(r.rows[0][1] == "100");
+    assert(r.rows[0][2] == "1");
+    assert(r.rows[0][3] == "22.000000");
+    assert(r.rows[0][4] == "3.000000");
+
+    // group 'b': 10, 20, 30
+    assert(r.rows[1][0] == "b");
+    assert(r.rows[1][1] == "30");
+    assert(r.rows[1][2] == "10");
+    assert(r.rows[1][3] == "20.000000");
+    assert(r.rows[1][4] == "20.000000");
+
+    std::cout << "[PASS] MAX/MIN/AVG/MEDIAN computed independently per GROUP BY group\n";
+    cleanup();
+}
+
+void test_select_having_count_filters_groups() {
+    cleanup();
+    Env env;
+    seed_people(env);  // eng: 10 rows, sales: 40 rows
+
+    auto r = exec(env, "SELECT dept, COUNT(*) FROM people GROUP BY dept HAVING COUNT(*) > 20;");
+    assert(r.success);
+    assert(r.rows.size() == 1);
+    assert(r.rows[0][0] == "sales");
+    assert(r.rows[0][1] == "40");
+
+    std::cout << "[PASS] HAVING COUNT(*) > n keeps only groups that satisfy it\n";
+    cleanup();
+}
+
+void test_select_having_avg_filters_groups() {
+    cleanup();
+    Env env;
+    seed_skewed_values(env);  // grp 'a': avg 22.0, grp 'b': avg 20.0
+
+    auto r = exec(env, "SELECT grp, AVG(val) FROM t GROUP BY grp HAVING AVG(val) < 21;");
+    assert(r.success);
+    assert(r.rows.size() == 1);
+    assert(r.rows[0][0] == "b");
+    assert(r.rows[0][1] == "20.000000");
+
+    std::cout << "[PASS] HAVING AVG(col) < n filters on a computed aggregate, not a stored column\n";
+    cleanup();
+}
+
+void test_select_having_and_logical() {
+    cleanup();
+    Env env;
+    seed_skewed_values(env);  // grp 'a': count 5, avg 22.0 | grp 'b': count 3, avg 20.0
+
+    auto r = exec(env,
+        "SELECT grp, COUNT(*), AVG(val) FROM t GROUP BY grp "
+        "HAVING COUNT(*) > 3 AND AVG(val) > 15;");
+    assert(r.success);
+    assert(r.rows.size() == 1);
+    assert(r.rows[0][0] == "a");  // 'b' fails COUNT(*) > 3 (3 is not > 3)
+
+    std::cout << "[PASS] HAVING <cond> AND <cond> requires both to hold\n";
+    cleanup();
+}
+
+void test_select_having_on_plain_grouped_column() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    auto r = exec(env, "SELECT dept, COUNT(*) FROM people GROUP BY dept HAVING dept = 'eng';");
+    assert(r.success);
+    assert(r.rows.size() == 1);
+    assert(r.rows[0][0] == "eng");
+    assert(r.rows[0][1] == "10");
+
+    std::cout << "[PASS] HAVING on a plain (non-aggregate) grouped column works\n";
+    cleanup();
+}
+
+void test_select_having_no_matching_groups_returns_empty_success() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    auto r = exec(env, "SELECT dept, COUNT(*) FROM people GROUP BY dept HAVING COUNT(*) > 1000;");
+    assert(r.success);
+    assert(r.rows.empty());
+
+    std::cout << "[PASS] HAVING that matches no groups returns an empty, successful result\n";
+    cleanup();
+}
+
+void test_select_having_without_group_by_rejected() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    auto r = exec(env, "SELECT COUNT(*) FROM people HAVING COUNT(*) > 5;");
+    assert(!r.success);
+
+    std::cout << "[PASS] HAVING without GROUP BY is rejected, not silently ignored\n";
+    cleanup();
+}
+
+void test_select_max_min_skip_nulls() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE t (id INT PRIMARY KEY, val INT);");
+    exec(env, "INSERT INTO t VALUES (1, 5);");
+    exec(env, "INSERT INTO t VALUES (2, NULL);");
+    exec(env, "INSERT INTO t VALUES (3, 9);");
+
+    auto r = exec(env, "SELECT MAX(val), MIN(val) FROM t;");
+    assert(r.success);
+    assert(r.rows[0][0] == "9");
+    assert(r.rows[0][1] == "5");
+
+    std::cout << "[PASS] MAX/MIN skip NULL values\n";
+    cleanup();
+}
+
+void test_select_max_min_avg_median_all_null_reports_null() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE t (id INT PRIMARY KEY, val INT);");
+    exec(env, "INSERT INTO t VALUES (1, NULL);");
+    exec(env, "INSERT INTO t VALUES (2, NULL);");
+
+    auto r = exec(env, "SELECT MAX(val), MIN(val), AVG(val), MEDIAN(val) FROM t;");
+    assert(r.success);
+    assert(r.rows[0][0] == "NULL");
+    assert(r.rows[0][1] == "NULL");
+    assert(r.rows[0][2] == "NULL");
+    assert(r.rows[0][3] == "NULL");
+
+    std::cout << "[PASS] MAX/MIN/AVG/MEDIAN over all-NULL input reports NULL, not an error\n";
+    cleanup();
+}
+
+void test_select_avg_on_non_numeric_column_fails() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(10));");
+    exec(env, "INSERT INTO t VALUES (1, 'x');");
+
+    auto r = exec(env, "SELECT AVG(name) FROM t;");
+    assert(!r.success);
+
+    std::cout << "[PASS] AVG on a non-numeric column is rejected, not silently wrong\n";
+    cleanup();
+}
+
+void test_select_max_on_varchar_column_works() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE t (id INT PRIMARY KEY, name VARCHAR(10));");
+    exec(env, "INSERT INTO t VALUES (1, 'banana');");
+    exec(env, "INSERT INTO t VALUES (2, 'apple');");
+    exec(env, "INSERT INTO t VALUES (3, 'cherry');");
+
+    auto r = exec(env, "SELECT MAX(name), MIN(name) FROM t;");
+    assert(r.success);
+    assert(r.rows[0][0] == "cherry");  // lexicographically largest
+    assert(r.rows[0][1] == "apple");   // lexicographically smallest
+
+    std::cout << "[PASS] MAX/MIN work on VARCHAR columns (lexicographic ordering)\n";
+    cleanup();
+}
+
+void test_select_group_by_count() {
+    cleanup();
+    Env env;
+    seed_people(env);  // i % 5 == 0 -> 'eng' (10 rows), else 'sales' (40 rows)
+
+    auto r = exec(env, "SELECT dept, COUNT(*) FROM people GROUP BY dept;");
+    assert(r.success);
+    assert(r.columns.size() == 2);
+    assert(r.columns[0] == "dept");
+    assert(r.columns[1] == "COUNT(*)");
+    assert(r.rows.size() == 2);  // exactly two groups: eng, sales
+
+    // std::map key ordering sorts group values ascending, so 'eng' < 'sales'
+    assert(r.rows[0][0] == "eng");
+    assert(r.rows[0][1] == "10");
+    assert(r.rows[1][0] == "sales");
+    assert(r.rows[1][1] == "40");
+
+    std::cout << "[PASS] SELECT col, COUNT(*) ... GROUP BY col groups correctly\n";
+    cleanup();
+}
+
+void test_select_group_by_plain_column_no_aggregate() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // GROUP BY with no aggregate column at all still dedups to one row
+    // per distinct dept — a plain "SELECT DISTINCT"-style use of GROUP BY.
+    auto r = exec(env, "SELECT dept FROM people GROUP BY dept;");
+    assert(r.success);
+    assert(r.rows.size() == 2);
+    assert(r.rows[0][0] == "eng");
+    assert(r.rows[1][0] == "sales");
+
+    std::cout << "[PASS] GROUP BY with no aggregate column dedups distinct values\n";
+    cleanup();
+}
+
+void test_select_group_by_with_where_filters_before_grouping() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // WHERE narrows the rows that get grouped, not the groups themselves —
+    // score > 45 only matches ids 46..50, all of which are 'sales'
+    // (46,47,48,49 are sales; 50 is eng, since 50 % 5 == 0).
+    auto r = exec(env, "SELECT dept, COUNT(*) FROM people WHERE score > 45 GROUP BY dept;");
+    assert(r.success);
+    assert(r.rows.size() == 2);
+    assert(r.rows[0][0] == "eng");
+    assert(r.rows[0][1] == "1");
+    assert(r.rows[1][0] == "sales");
+    assert(r.rows[1][1] == "4");
+
+    std::cout << "[PASS] WHERE filters rows before GROUP BY buckets them\n";
+    cleanup();
+}
+
+void test_select_group_by_count_column_skips_nulls() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE t (id INT PRIMARY KEY, grp VARCHAR(10), val INT);");
+    exec(env, "INSERT INTO t VALUES (1, 'a', 10);");
+    exec(env, "INSERT INTO t VALUES (2, 'a', NULL);");
+    exec(env, "INSERT INTO t VALUES (3, 'b', 5);");
+    exec(env, "INSERT INTO t VALUES (4, 'b', 7);");
+
+    auto r = exec(env, "SELECT grp, COUNT(val) FROM t GROUP BY grp;");
+    assert(r.success);
+    assert(r.rows.size() == 2);
+    assert(r.rows[0][0] == "a");
+    assert(r.rows[0][1] == "1");   // one NULL skipped
+    assert(r.rows[1][0] == "b");
+    assert(r.rows[1][1] == "2");
+
+    std::cout << "[PASS] COUNT(col) under GROUP BY skips NULLs per group\n";
+    cleanup();
+}
+
+void test_select_group_by_nulls_form_one_group() {
+    cleanup();
+    Env env;
+    exec(env, "CREATE TABLE t (id INT PRIMARY KEY, grp VARCHAR(10));");
+    exec(env, "INSERT INTO t VALUES (1, NULL);");
+    exec(env, "INSERT INTO t VALUES (2, NULL);");
+    exec(env, "INSERT INTO t VALUES (3, 'x');");
+
+    auto r = exec(env, "SELECT grp, COUNT(*) FROM t GROUP BY grp;");
+    assert(r.success);
+    assert(r.rows.size() == 2);  // NULL group + 'x' group, not two separate NULL groups
+
+    bool found_null_group = false;
+    for (auto& row : r.rows) {
+        if (row[0] == "NULL") {
+            found_null_group = true;
+            assert(row[1] == "2");
+        }
+    }
+    assert(found_null_group);
+
+    std::cout << "[PASS] GROUP BY treats NULL as a single group, unlike WHERE comparisons\n";
+    cleanup();
+}
+
+void test_select_group_by_ungrouped_plain_column_rejected() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // 'age' is neither aggregated nor in the GROUP BY list — must be rejected.
+    auto r = exec(env, "SELECT dept, age, COUNT(*) FROM people GROUP BY dept;");
+    assert(!r.success);
+    assert(r.error_message.find("age") != std::string::npos);
+
+    std::cout << "[PASS] GROUP BY rejects a plain SELECT column absent from the GROUP BY list\n";
+    cleanup();
+}
+
+void test_select_group_by_with_join_rejected() {
+    cleanup();
+    Env env;
+    seed_orders_customers(env, false);
+
+    auto r = exec(env,
+        "SELECT customers.name, COUNT(*) FROM customers "
+        "INNER JOIN orders ON customers.id = orders.customer_id GROUP BY customers.name;");
+    assert(!r.success);
+
+    std::cout << "[PASS] GROUP BY with JOIN is rejected (v1 scope)\n";
+    cleanup();
+}
+
 void test_update_where_indexed_equality() {
     cleanup();
     Env env;
@@ -1500,6 +1847,32 @@ int main() {
     test_correlated_in_subquery_matches_customers_with_orders();
     test_select_or_clause_not_incorrectly_narrowed();
     test_select_count_aggregate_uses_index();
+
+    std::cout << "\n=== Aggregate Function Tests (MAX/MIN/AVG/MEDIAN) ===\n";
+    test_select_max_min_avg_median_whole_table();
+    test_select_max_min_skip_nulls();
+    test_select_max_min_avg_median_all_null_reports_null();
+    test_select_avg_on_non_numeric_column_fails();
+    test_select_max_on_varchar_column_works();
+
+    std::cout << "\n=== GROUP BY Tests ===\n";
+    test_select_group_by_count();
+    test_select_group_by_plain_column_no_aggregate();
+    test_select_group_by_with_where_filters_before_grouping();
+    test_select_group_by_count_column_skips_nulls();
+    test_select_group_by_nulls_form_one_group();
+    test_select_group_by_ungrouped_plain_column_rejected();
+    test_select_group_by_with_join_rejected();
+    test_select_group_by_max_min_avg_median();
+
+    std::cout << "\n=== HAVING Tests ===\n";
+    test_select_having_count_filters_groups();
+    test_select_having_avg_filters_groups();
+    test_select_having_and_logical();
+    test_select_having_on_plain_grouped_column();
+    test_select_having_no_matching_groups_returns_empty_success();
+    test_select_having_without_group_by_rejected();
+
     test_update_where_indexed_equality();
     test_delete_where_unique_index_deletes_one_row();
     test_delete_where_nonunique_index_deletes_all_matches();

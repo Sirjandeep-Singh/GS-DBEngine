@@ -9,9 +9,9 @@ enum class TokenType {
     USE, SHOW, DATABASES, DATABASE, TABLES, DESCRIBE,
     INDEX, UNIQUE,
     AND, OR, NOT, NULL_KW,               // NULL_KW to avoid clash with NULL macro
-    IS, LIKE, ORDER, BY, ASC, DESC,
+    IS, LIKE, ORDER, BY, ASC, DESC, GROUP, HAVING,
     LIMIT, JOIN, INNER, LEFT, RIGHT, ON,
-    PRIMARY, KEY, AUTO_INCREMENT, CHECK, COUNT, IN, EXISTS, DEFAULT,
+    PRIMARY, KEY, AUTO_INCREMENT, CHECK, COUNT, MAX, MIN, AVG, MEDIAN, IN, EXISTS, DEFAULT,
     FOREIGN, REFERENCES, CASCADE, RESTRICT,
     INT_KW, FLOAT_KW, BOOLEAN_KW, VARCHAR_KW,  // type keywords
     TRUE_KW, FALSE_KW,                           // boolean literals as keywords

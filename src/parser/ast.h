@@ -88,11 +88,19 @@ struct WhereExpr {
 // SELECT statement
 // ─────────────────────────────────────────────
 
-// Aggregate functions usable in a SELECT column list.
-// v1 scope: COUNT only, and only when every column in the SELECT list is
-// an aggregate (no GROUP BY yet, so mixing aggregate + plain columns is
-// not meaningful — that's exactly what GROUP BY exists to make meaningful).
-enum class AggregateType { NONE, COUNT_STAR, COUNT_COLUMN };
+// Aggregate functions usable in a SELECT column list: COUNT(*)/COUNT(col),
+// MAX(col), MIN(col), AVG(col), MEDIAN(col). MAX/MIN/AVG/MEDIAN always take
+// a single column argument — unlike COUNT, there's no `*` form for them.
+// AVG/MEDIAN require a numeric (INT/FLOAT) column and always report their
+// result as FLOAT, even over an all-INT column — see
+// Executor::compute_aggregate_column.
+//
+// With no GROUP BY, every column in the SELECT list must be an aggregate
+// (mixing aggregate + plain columns is meaningless without GROUP BY — see
+// execute_select). With GROUP BY present, a plain column is allowed
+// alongside an aggregate as long as it's also named in the GROUP BY list —
+// see Executor::execute_select_group_by.
+enum class AggregateType { NONE, COUNT_STAR, COUNT_COLUMN, MAX, MIN, AVG, MEDIAN };
 
 // A selected column: *, name, users.name, COUNT(*), COUNT(name), or a bare
 // literal (1, 'x', TRUE, NULL) — most commonly seen as `SELECT 1` in an
@@ -104,6 +112,42 @@ struct SelectColumn {
     Value         literal;              // used if is_literal
     ColumnRef     column;               // used if not star/literal, or if aggregate == COUNT_COLUMN
     AggregateType aggregate = AggregateType::NONE;
+};
+
+// A HAVING comparison: COUNT(*) > 5, AVG(salary) >= 50000, dept = 'eng'.
+// Deliberately a separate, smaller structure from CompareExpr/WhereExpr
+// rather than reusing them: WHERE's left-hand side is always a bare
+// ColumnRef (it filters rows before any grouping happens, so aggregates
+// aren't meaningful there), while HAVING's left-hand side is evaluated
+// per group and is exactly the same "aggregate or plain column" shape a
+// SELECT column already has — hence reusing SelectColumn here instead of
+// introducing a third representation. v1 scope: comparison against a
+// literal value only (no column-vs-column, no subqueries, no LIKE/IS
+// NULL) — the operators that make sense for "HAVING <aggregate> <op>
+// <value>", which covers the overwhelming majority of real HAVING usage.
+struct HavingCompareExpr {
+    SelectColumn operand;  // e.g. COUNT(*), AVG(salary), or a plain grouped column
+    CompareOp    op = CompareOp::EQ;   // one of EQ/NEQ/LT/GT/LTE/GTE
+    Value        value;                // literal RHS
+};
+
+// Forward declaration for recursive expression tree
+struct HavingExpr;
+using HavingExprPtr = std::unique_ptr<HavingExpr>;
+
+// A HAVING expression node — a comparison or a logical combination.
+// Mirrors WhereExpr's Kind::COMPARE / Kind::LOGICAL shape (no EXISTS
+// analog — HAVING doesn't support subqueries in this codebase yet).
+struct HavingExpr {
+    enum class Kind { COMPARE, LOGICAL } kind;
+
+    // for COMPARE nodes
+    HavingCompareExpr compare;
+
+    // for LOGICAL nodes
+    LogicalOp     logical_op;
+    HavingExprPtr left;
+    HavingExprPtr right;  // null for NOT
 };
 
 // JOIN types supported
@@ -128,6 +172,17 @@ struct SelectStmt {
     std::string                table_alias;      // empty if no alias
     std::vector<JoinClause>    joins;
     WhereExprPtr               where;            // null if no WHERE
+    // GROUP BY column list, in declared order. Empty means no GROUP BY.
+    // Every plain (non-aggregate, non-literal) column in `columns` must
+    // appear here — enforced by Executor::execute_select_group_by, not the
+    // parser.
+    std::vector<ColumnRef>     group_by;
+    // HAVING filters groups after GROUP BY buckets them (unlike WHERE,
+    // which filters rows before grouping). Null if no HAVING clause.
+    // Requires group_by to be non-empty — enforced by the executor, not
+    // the parser, matching how group_by's own SELECT-column rule is
+    // enforced there instead of here.
+    HavingExprPtr               having;
     std::vector<OrderByClause> order_by;
     std::optional<uint32_t>    limit;            // nullopt if no LIMIT
 };

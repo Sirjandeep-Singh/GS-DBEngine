@@ -124,6 +124,16 @@ SelectStmt Parser::parse_select_body() {
     // optional WHERE
     stmt.where = parse_where();
 
+    // optional GROUP BY
+    if (check(TokenType::GROUP)) {
+        stmt.group_by = parse_group_by();
+    }
+
+    // optional HAVING
+    if (check(TokenType::HAVING)) {
+        stmt.having = parse_having();
+    }
+
     // optional ORDER BY
     if (check(TokenType::ORDER)) {
         stmt.order_by = parse_order_by();
@@ -151,32 +161,54 @@ std::vector<SelectColumn> Parser::parse_select_columns() {
 
     do {
         SelectColumn col;
-        if (match(TokenType::COUNT)) {
-            expect(TokenType::LPAREN, "COUNT(...)");
-            if (match(TokenType::STAR)) {
-                col.aggregate = AggregateType::COUNT_STAR;
-            } else {
-                col.column    = parse_column_ref();
-                col.aggregate = AggregateType::COUNT_COLUMN;
-            }
-            expect(TokenType::RPAREN, "COUNT(...)");
-        } else if (check(TokenType::INTEGER_LITERAL) || check(TokenType::FLOAT_LITERAL) ||
-                   check(TokenType::STRING_LITERAL)  || check(TokenType::TRUE_KW) ||
-                   check(TokenType::FALSE_KW)        || check(TokenType::NULL_KW) ||
-                   check(TokenType::MINUS)) {
+        if (check(TokenType::INTEGER_LITERAL) || check(TokenType::FLOAT_LITERAL) ||
+            check(TokenType::STRING_LITERAL)  || check(TokenType::TRUE_KW) ||
+            check(TokenType::FALSE_KW)        || check(TokenType::NULL_KW) ||
+            check(TokenType::MINUS)) {
             // A bare literal projection — most common as `SELECT 1 FROM ...`
             // inside an EXISTS subquery, where the projected value doesn't
             // matter and only row presence is checked.
             col.is_literal = true;
             col.literal     = parse_value();
         } else {
-            col.is_star = false;
-            col.column  = parse_column_ref();
+            col = parse_aggregate_or_column();
         }
         cols.push_back(std::move(col));
     } while (match(TokenType::COMMA));
 
     return cols;
+}
+
+SelectColumn Parser::parse_aggregate_or_column() {
+    SelectColumn col;
+    if (match(TokenType::COUNT)) {
+        expect(TokenType::LPAREN, "COUNT(...)");
+        if (match(TokenType::STAR)) {
+            col.aggregate = AggregateType::COUNT_STAR;
+        } else {
+            col.column    = parse_column_ref();
+            col.aggregate = AggregateType::COUNT_COLUMN;
+        }
+        expect(TokenType::RPAREN, "COUNT(...)");
+    } else if (check(TokenType::MAX) || check(TokenType::MIN) ||
+               check(TokenType::AVG) || check(TokenType::MEDIAN)) {
+        // MAX/MIN/AVG/MEDIAN always take exactly one column argument —
+        // unlike COUNT, there's no `*` form for any of them.
+        AggregateType agg;
+        std::string   fn_name = token_type_name(peek().type);
+        if      (check(TokenType::MAX))    agg = AggregateType::MAX;
+        else if (check(TokenType::MIN))    agg = AggregateType::MIN;
+        else if (check(TokenType::AVG))    agg = AggregateType::AVG;
+        else                                agg = AggregateType::MEDIAN;
+        advance();
+        expect(TokenType::LPAREN, fn_name + "(...)");
+        col.column    = parse_column_ref();
+        col.aggregate = agg;
+        expect(TokenType::RPAREN, fn_name + "(...)");
+    } else {
+        col.column = parse_column_ref();
+    }
+    return col;
 }
 
 JoinClause Parser::parse_join() {
@@ -228,6 +260,99 @@ std::vector<OrderByClause> Parser::parse_order_by() {
     } while (match(TokenType::COMMA));
 
     return clauses;
+}
+
+std::vector<ColumnRef> Parser::parse_group_by() {
+    expect(TokenType::GROUP, "GROUP BY");
+    expect(TokenType::BY,    "GROUP BY");
+
+    std::vector<ColumnRef> cols;
+    do {
+        cols.push_back(parse_column_ref());
+    } while (match(TokenType::COMMA));
+
+    return cols;
+}
+
+// ─────────────────────────────────────────────
+// HAVING clause
+// ─────────────────────────────────────────────
+//
+// Structurally a copy of the WHERE grammar chain (parse_or_expr /
+// parse_and_expr / parse_not_expr / parse_compare_expr) — same OR/AND/NOT
+// precedence — with two differences: the left-hand side of a comparison is
+// an aggregate-or-column (parse_aggregate_or_column) instead of a bare
+// ColumnRef, and there's no EXISTS/subquery/column-vs-column support (v1
+// scope — see the HavingCompareExpr comment in ast.h).
+
+HavingExprPtr Parser::parse_having() {
+    expect(TokenType::HAVING, "HAVING");
+    return parse_having_or_expr();
+}
+
+// OR has the lowest precedence
+HavingExprPtr Parser::parse_having_or_expr() {
+    auto left = parse_having_and_expr();
+
+    while (match(TokenType::OR)) {
+        auto right = parse_having_and_expr();
+        auto node  = std::make_unique<HavingExpr>();
+        node->kind       = HavingExpr::Kind::LOGICAL;
+        node->logical_op = LogicalOp::OR;
+        node->left       = std::move(left);
+        node->right      = std::move(right);
+        left = std::move(node);
+    }
+
+    return left;
+}
+
+// AND has higher precedence than OR
+HavingExprPtr Parser::parse_having_and_expr() {
+    auto left = parse_having_not_expr();
+
+    while (match(TokenType::AND)) {
+        auto right = parse_having_not_expr();
+        auto node  = std::make_unique<HavingExpr>();
+        node->kind       = HavingExpr::Kind::LOGICAL;
+        node->logical_op = LogicalOp::AND;
+        node->left       = std::move(left);
+        node->right      = std::move(right);
+        left = std::move(node);
+    }
+
+    return left;
+}
+
+// NOT has higher precedence than AND
+HavingExprPtr Parser::parse_having_not_expr() {
+    if (match(TokenType::NOT)) {
+        auto operand = parse_having_compare_expr();
+        auto node    = std::make_unique<HavingExpr>();
+        node->kind       = HavingExpr::Kind::LOGICAL;
+        node->logical_op = LogicalOp::NOT;
+        node->left       = std::move(operand);
+        node->right      = nullptr;
+        return node;
+    }
+    return parse_having_compare_expr();
+}
+
+HavingExprPtr Parser::parse_having_compare_expr() {
+    auto node = std::make_unique<HavingExpr>();
+    node->kind            = HavingExpr::Kind::COMPARE;
+    node->compare.operand = parse_aggregate_or_column();
+
+    if      (match(TokenType::EQ))  node->compare.op = CompareOp::EQ;
+    else if (match(TokenType::NEQ)) node->compare.op = CompareOp::NEQ;
+    else if (match(TokenType::LTE)) node->compare.op = CompareOp::LTE;
+    else if (match(TokenType::GTE)) node->compare.op = CompareOp::GTE;
+    else if (match(TokenType::LT))  node->compare.op = CompareOp::LT;
+    else if (match(TokenType::GT))  node->compare.op = CompareOp::GT;
+    else throw std::runtime_error(error_msg("comparison operator (=, !=, <, >, <=, >=) in HAVING"));
+
+    node->compare.value = parse_value();
+    return node;
 }
 
 // ─────────────────────────────────────────────
