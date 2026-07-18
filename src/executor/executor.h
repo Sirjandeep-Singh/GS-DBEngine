@@ -278,7 +278,9 @@ private:
 
     // Handles SELECT lists where every column is an aggregate (COUNT/MAX/
     // MIN/AVG/MEDIAN) and there's no GROUP BY — a single-row result
-    // computed over a WHERE-filtered scan. v1 scope: no JOIN.
+    // computed over a WHERE-filtered scan (or, when stmt.joins is
+    // non-empty, over a WHERE-filtered nested_loop_join of stmt.joins[0] —
+    // same one-join-clause scope the plain SELECT JOIN path already has).
     QueryResult execute_select_aggregate(const SelectStmt&  stmt,
                                           const TableSchema& schema,
                                           Table&              tbl) const;
@@ -288,11 +290,14 @@ private:
     // GROUP BY column (validated here, not by the parser); aggregate
     // columns (COUNT/MAX/MIN/AVG/MEDIAN) are computed per group via
     // compute_aggregate_column. An optional HAVING clause filters groups
-    // after they're built (see evaluate_having) and before LIMIT is
-    // applied. v1 scope: no JOIN, no ORDER BY (ORDER BY on a grouped/
-    // aggregate result needs to sort the projected output rather than a
-    // schema-indexed Row, which the existing sort_by_column helper in
-    // execute_select doesn't support yet).
+    // after they're built (see evaluate_having); an optional ORDER BY (a
+    // single clause only, same limitation as the rest of this codebase's
+    // ORDER BY — see sort_by_column) sorts the surviving groups by an
+    // aggregate or a GROUP BY column, computed via compute_aggregate_value.
+    // LIMIT is applied last. When stmt.joins is non-empty, groups are built
+    // from the (WHERE-filtered) joined rows instead of a plain scan — same
+    // one-join-clause scope as execute_select_aggregate and the plain
+    // SELECT JOIN path.
     QueryResult execute_select_group_by(const SelectStmt&  stmt,
                                          const TableSchema& schema,
                                          Table&              tbl) const;
@@ -305,12 +310,18 @@ private:
     // use); AVG/MEDIAN require a numeric column and always report a FLOAT
     // result, even over an all-INT column. Any aggregate over zero
     // non-NULL values reports NULL (COUNT reports 0, matching real SQL).
-    // Thin formatting wrapper around compute_aggregate_value.
+    // Thin formatting wrapper around compute_aggregate_value. right_schema/
+    // right_alias are non-null/non-empty for JOIN queries — 'rows' then
+    // holds combined (left+right) rows and column resolution uses the
+    // two-schema resolve_column overload, exactly like evaluate_where does
+    // for WHERE.
     std::pair<std::string, std::string> compute_aggregate_column(
         const SelectColumn&             sc,
         const std::vector<ScanResult>&  rows,
         const TableSchema&              schema,
-        const std::string&              alias) const;
+        const std::string&              alias,
+        const TableSchema*               right_schema = nullptr,
+        const std::string&               right_alias  = "") const;
 
     // Same computation as compute_aggregate_column, minus the string
     // formatting — returns the raw Value (monostate for NULL) so callers
@@ -318,11 +329,14 @@ private:
     // display it, don't have to parse a string back out. Used by
     // compute_aggregate_column itself and by evaluate_having (HAVING needs
     // the actual value to run compare_values against a literal).
+    // right_schema/right_alias — see compute_aggregate_column.
     Value compute_aggregate_value(
         const SelectColumn&             sc,
         const std::vector<ScanResult>&  rows,
         const TableSchema&              schema,
-        const std::string&              alias) const;
+        const std::string&              alias,
+        const TableSchema*               right_schema = nullptr,
+        const std::string&               right_alias  = "") const;
 
     // Returns the display header for an aggregate SELECT column, e.g.
     // "COUNT(*)", "MAX(age)". Single source of truth for aggregate header
@@ -338,11 +352,15 @@ private:
     // compute_aggregate_value (which handles both aggregate and plain
     // grouped-column operands) instead of a direct row lookup, and the
     // actual comparison reuses the same compare_values helper evaluate_
-    // where's evaluate_compare does — see executor.cpp.
+    // where's evaluate_compare does — see executor.cpp. right_schema/
+    // right_alias — see compute_aggregate_column; forwarded straight
+    // through to it here.
     bool evaluate_having(const HavingExprPtr&            expr,
                           const std::vector<ScanResult>&  group_rows,
                           const TableSchema&               schema,
-                          const std::string&               alias) const;
+                          const std::string&               alias,
+                          const TableSchema*                right_schema = nullptr,
+                          const std::string&                right_alias  = "") const;
     QueryResult execute_insert(const InsertStmt& stmt);
     QueryResult execute_update(const UpdateStmt& stmt);
     QueryResult execute_delete(const DeleteStmt& stmt);

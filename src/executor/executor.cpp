@@ -462,7 +462,8 @@ bool Executor::is_select_coverable(const std::vector<SelectColumn>&  columns,
         if (!ref_is_covered(sc.column)) return false;
     }
     for (const auto& ob : order_by) {
-        if (!ref_is_covered(ob.column)) return false;
+        if (ob.operand.aggregate != AggregateType::NONE) return false;  // aggregate ORDER BY isn't a per-row concept
+        if (!ref_is_covered(ob.operand.column)) return false;
     }
     return where_is_coverable(where, schema, alias, covered);
 }
@@ -1204,9 +1205,6 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
             return {false, "SELECT: cannot mix aggregate functions with plain "
                            "columns without GROUP BY (not yet supported)"};
         }
-        if (!stmt.joins.empty()) {
-            return {false, "SELECT: aggregate functions are not yet supported with JOIN"};
-        }
         return execute_select_aggregate(stmt, schema, left_tbl);
     }
 
@@ -1259,7 +1257,10 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
         // ORDER BY (only first clause honoured — no secondary sort key)
         if (!stmt.order_by.empty()) {
             const OrderByClause& ob = stmt.order_by[0];
-            size_t col_idx = resolve_column(ob.column, schema, stmt.table_alias);
+            if (ob.operand.aggregate != AggregateType::NONE) {
+                return {false, "SELECT: ORDER BY on an aggregate function requires GROUP BY"};
+            }
+            size_t col_idx = resolve_column(ob.operand.column, schema, stmt.table_alias);
             sort_by_column(rows, col_idx, ob.ascending,
                            [](const ScanResult& sr) -> const Row& { return sr.row; });
         }
@@ -1309,7 +1310,10 @@ QueryResult Executor::execute_select(const SelectStmt& stmt)
         // ORDER BY — two-schema resolve
         if (!stmt.order_by.empty()) {
             const OrderByClause& ob = stmt.order_by[0];
-            size_t col_idx = resolve_column(ob.column, schema, right_schema,
+            if (ob.operand.aggregate != AggregateType::NONE) {
+                return {false, "SELECT: ORDER BY on an aggregate function requires GROUP BY"};
+            }
+            size_t col_idx = resolve_column(ob.operand.column, schema, right_schema,
                                              stmt.table_alias, right_alias);
             sort_by_column(filtered, col_idx, ob.ascending,
                            [](const JoinedRow& jr) -> const Row& { return jr.row; });
@@ -1336,8 +1340,45 @@ QueryResult Executor::execute_select_aggregate(const SelectStmt&  stmt,
                                                 const TableSchema& schema,
                                                 Table&              tbl) const
 {
-    Predicate pred = build_predicate(stmt.where, schema, nullptr, nullptr, stmt.table_alias);
-    std::vector<ScanResult> rows = scan_with_index(tbl, schema, stmt.where, pred, stmt.table_alias);
+    // right_schema/right_alias stay null/empty for the no-JOIN case, which
+    // makes every downstream compute_aggregate_* call behave exactly as it
+    // did before JOIN support was added (single-schema resolve_column).
+    const TableSchema* right_schema = nullptr;
+    std::string         right_alias;
+    std::vector<ScanResult> rows;
+
+    if (stmt.joins.empty()) {
+        Predicate pred = build_predicate(stmt.where, schema, nullptr, nullptr, stmt.table_alias);
+        rows = scan_with_index(tbl, schema, stmt.where, pred, stmt.table_alias);
+    } else {
+        // ── JOIN path — one join clause, nested-loop — mirrors the plain
+        // (non-aggregate) SELECT JOIN path in execute_select: scan the left
+        // table fully, join, then apply WHERE over the combined rows.
+        const JoinClause&  join    = stmt.joins[0];
+        const TableSchema& rschema = catalog_.get_table(join.table_name);
+        Table               right_tbl(rschema, buffer_pool_, wal_, free_list_);
+        right_alias = join.alias;
+
+        Predicate all_rows = [](const Row&) { return true; };
+        std::vector<ScanResult> left_results = tbl.scan(all_rows);
+
+        std::vector<JoinedRow> joined =
+            nested_loop_join(left_results, schema, right_tbl, rschema, join,
+                              stmt.table_alias, right_alias);
+
+        SubqueryCache where_cache;
+        if (stmt.where) precompute_subqueries(stmt.where, where_cache);
+
+        rows.reserve(joined.size());
+        for (auto& jr : joined) {
+            if (!stmt.where ||
+                evaluate_where(stmt.where, jr.row, schema, &rschema, &where_cache,
+                                nullptr, stmt.table_alias, right_alias)) {
+                rows.push_back({std::move(jr.left_pk), std::move(jr.row)});
+            }
+        }
+        right_schema = &rschema;
+    }
 
     QueryResult result;
     result.success = true;
@@ -1346,7 +1387,8 @@ QueryResult Executor::execute_select_aggregate(const SelectStmt&  stmt,
     row_out.reserve(stmt.columns.size());
 
     for (const auto& sc : stmt.columns) {
-        auto [header, value] = compute_aggregate_column(sc, rows, schema, stmt.table_alias);
+        auto [header, value] = compute_aggregate_column(sc, rows, schema, stmt.table_alias,
+                                                          right_schema, right_alias);
         result.columns.push_back(std::move(header));
         row_out.push_back(std::move(value));
     }
@@ -1372,10 +1414,12 @@ std::pair<std::string, std::string> Executor::compute_aggregate_column(
     const SelectColumn&            sc,
     const std::vector<ScanResult>& rows,
     const TableSchema&              schema,
-    const std::string&              alias) const
+    const std::string&              alias,
+    const TableSchema*               right_schema,
+    const std::string&               right_alias) const
 {
     const std::string header = aggregate_header_label(sc.aggregate, sc.column.column_name);
-    const Value        value  = compute_aggregate_value(sc, rows, schema, alias);
+    const Value        value  = compute_aggregate_value(sc, rows, schema, alias, right_schema, right_alias);
     return {header, is_null(value) ? "NULL" : value_to_string(value)};
 }
 
@@ -1383,14 +1427,20 @@ Value Executor::compute_aggregate_value(
     const SelectColumn&            sc,
     const std::vector<ScanResult>& rows,
     const TableSchema&              schema,
-    const std::string&              alias) const
+    const std::string&              alias,
+    const TableSchema*               right_schema,
+    const std::string&               right_alias) const
 {
     if (sc.aggregate == AggregateType::COUNT_STAR) {
         return static_cast<int32_t>(rows.size());
     }
 
     // Every remaining case reads a specific column, so resolve it once.
-    size_t idx = resolve_column(sc.column, schema, alias);  // throws on unknown column
+    // right_schema is non-null for JOIN queries — same two-schema
+    // resolution evaluate_where uses for WHERE against a combined row.
+    size_t idx = right_schema
+        ? resolve_column(sc.column, schema, *right_schema, alias, right_alias)
+        : resolve_column(sc.column, schema, alias);  // throws on unknown column
 
     if (sc.aggregate == AggregateType::NONE) {
         // A plain grouped column — e.g. HAVING's left-hand side doesn't
@@ -1470,13 +1520,10 @@ QueryResult Executor::execute_select_group_by(const SelectStmt&  stmt,
                                                Table&              tbl) const
 {
     // v1 scope restrictions — mirror execute_select_aggregate's own
-    // restrictions where the same reasoning applies.
-    if (!stmt.joins.empty()) {
-        return {false, "SELECT: GROUP BY is not yet supported with JOIN"};
-    }
-    if (!stmt.order_by.empty()) {
-        return {false, "SELECT: ORDER BY is not yet supported together with GROUP BY"};
-    }
+    // restrictions where the same reasoning applies. JOIN itself is no
+    // longer restricted here (see the JOIN branch below) — only the
+    // "more than one join clause" case stays unsupported, same as the
+    // plain SELECT JOIN path (stmt.joins[0] is the only clause honoured).
     if (stmt.having && stmt.group_by.empty()) {
         // Real SQL allows HAVING without GROUP BY (the whole result set is
         // treated as a single group) — out of scope here for now, so this
@@ -1485,6 +1532,26 @@ QueryResult Executor::execute_select_group_by(const SelectStmt&  stmt,
         // this function when group_by is non-empty, but kept as a direct
         // check rather than relying on that caller invariant.
         return {false, "SELECT: HAVING requires GROUP BY"};
+    }
+    if (stmt.order_by.size() > 1) {
+        // Matches the rest of this codebase's existing ORDER BY limitation
+        // (see execute_select's sort_by_column comment) — only the first
+        // clause is honoured, no secondary sort key, for GROUP BY results
+        // either.
+        return {false, "SELECT: only a single ORDER BY column is supported"};
+    }
+    if (!stmt.order_by.empty()) {
+        const SelectColumn& operand = stmt.order_by[0].operand;
+        if (operand.aggregate == AggregateType::NONE) {
+            bool in_group_by = false;
+            for (const auto& gb : stmt.group_by) {
+                if (gb.column_name == operand.column.column_name) { in_group_by = true; break; }
+            }
+            if (!in_group_by) {
+                return {false, "SELECT: ORDER BY column '" + operand.column.column_name +
+                               "' must appear in GROUP BY or be used inside an aggregate function"};
+            }
+        }
     }
 
     // Every plain (non-aggregate, non-literal) SELECT column must also be a
@@ -1508,14 +1575,56 @@ QueryResult Executor::execute_select_group_by(const SelectStmt&  stmt,
         }
     }
 
-    Predicate pred = build_predicate(stmt.where, schema, nullptr, nullptr, stmt.table_alias);
-    std::vector<ScanResult> rows = scan_with_index(tbl, schema, stmt.where, pred, stmt.table_alias);
+    // right_schema/right_alias stay null/empty for the no-JOIN case —
+    // every downstream resolve_column/compute_aggregate_*/evaluate_having
+    // call then behaves exactly as it did before JOIN support was added.
+    const TableSchema* right_schema = nullptr;
+    std::string         right_alias;
+    std::vector<ScanResult> rows;
 
-    // Resolve GROUP BY column indices once, up front.
+    if (stmt.joins.empty()) {
+        Predicate pred = build_predicate(stmt.where, schema, nullptr, nullptr, stmt.table_alias);
+        rows = scan_with_index(tbl, schema, stmt.where, pred, stmt.table_alias);
+    } else {
+        // ── JOIN path — one join clause, nested-loop — mirrors the plain
+        // (non-aggregate) SELECT JOIN path in execute_select: scan the left
+        // table fully, join, then apply WHERE over the combined rows.
+        const JoinClause&  join    = stmt.joins[0];
+        const TableSchema& rschema = catalog_.get_table(join.table_name);
+        Table               right_tbl(rschema, buffer_pool_, wal_, free_list_);
+        right_alias = join.alias;
+
+        Predicate all_rows = [](const Row&) { return true; };
+        std::vector<ScanResult> left_results = tbl.scan(all_rows);
+
+        std::vector<JoinedRow> joined =
+            nested_loop_join(left_results, schema, right_tbl, rschema, join,
+                              stmt.table_alias, right_alias);
+
+        SubqueryCache where_cache;
+        if (stmt.where) precompute_subqueries(stmt.where, where_cache);
+
+        rows.reserve(joined.size());
+        for (auto& jr : joined) {
+            if (!stmt.where ||
+                evaluate_where(stmt.where, jr.row, schema, &rschema, &where_cache,
+                                nullptr, stmt.table_alias, right_alias)) {
+                rows.push_back({std::move(jr.left_pk), std::move(jr.row)});
+            }
+        }
+        right_schema = &rschema;
+    }
+
+    // Resolve GROUP BY column indices once, up front. right_schema is
+    // non-null for JOIN queries — a GROUP BY column may come from either
+    // side of the join, same two-schema resolution WHERE/ORDER BY use.
     std::vector<size_t> group_col_idx;
     group_col_idx.reserve(stmt.group_by.size());
     for (const auto& gb : stmt.group_by) {
-        group_col_idx.push_back(resolve_column(gb, schema, stmt.table_alias));  // throws on unknown column
+        size_t idx = right_schema
+            ? resolve_column(gb, schema, *right_schema, stmt.table_alias, right_alias)
+            : resolve_column(gb, schema, stmt.table_alias);  // throws on unknown column
+        group_col_idx.push_back(idx);
     }
 
     // Bucket rows by their GROUP BY key. std::map's default ordering on
@@ -1547,11 +1656,14 @@ QueryResult Executor::execute_select_group_by(const SelectStmt&  stmt,
     }
 
     // Iteration order follows std::map's key ordering (sorted ascending by
-    // GROUP BY column values) — deterministic, though not something a
-    // caller should rely on as "the" order without an explicit ORDER BY
-    // once that's supported here.
+    // GROUP BY column values) unless overridden by an explicit ORDER BY
+    // below — a caller shouldn't rely on map order as "the" order.
+    std::vector<std::pair<Value, std::vector<std::string>>> output_rows;
+    output_rows.reserve(groups.size());
+
     for (const auto& [key, group_rows] : groups) {
-        if (stmt.having && !evaluate_having(stmt.having, group_rows, schema, stmt.table_alias)) {
+        if (stmt.having && !evaluate_having(stmt.having, group_rows, schema, stmt.table_alias,
+                                             right_schema, right_alias)) {
             continue;
         }
 
@@ -1561,13 +1673,51 @@ QueryResult Executor::execute_select_group_by(const SelectStmt&  stmt,
             if (sc.is_literal) {
                 row_out.push_back(value_to_string(sc.literal));
             } else if (sc.aggregate != AggregateType::NONE) {
-                auto [header, value] = compute_aggregate_column(sc, group_rows, schema, stmt.table_alias);
+                auto [header, value] = compute_aggregate_column(sc, group_rows, schema, stmt.table_alias,
+                                                                  right_schema, right_alias);
                 row_out.push_back(std::move(value));
             } else {
-                size_t idx = resolve_column(sc.column, schema, stmt.table_alias);
+                size_t idx = right_schema
+                    ? resolve_column(sc.column, schema, *right_schema, stmt.table_alias, right_alias)
+                    : resolve_column(sc.column, schema, stmt.table_alias);
                 row_out.push_back(value_to_string(group_rows.front().row.get(idx)));
             }
         }
+
+        // Sort key — only computed when there's an ORDER BY to satisfy.
+        // Reuses compute_aggregate_value so the key can be an aggregate
+        // (e.g. ORDER BY COUNT(*)) just as easily as a plain GROUP BY
+        // column, exactly like HAVING's operand does.
+        Value order_key = stmt.order_by.empty()
+            ? Value{std::monostate{}}
+            : compute_aggregate_value(stmt.order_by[0].operand, group_rows, schema, stmt.table_alias,
+                                       right_schema, right_alias);
+
+        output_rows.emplace_back(std::move(order_key), std::move(row_out));
+    }
+
+    if (!stmt.order_by.empty()) {
+        bool ascending = stmt.order_by[0].ascending;
+        std::stable_sort(output_rows.begin(), output_rows.end(),
+            [ascending](const auto& a, const auto& b) {
+                const Value& va = a.first;
+                const Value& vb = b.first;
+
+                // Same "NULLs sort last, regardless of direction" rule
+                // sort_by_column uses for the non-grouped ORDER BY path.
+                bool a_null = is_null(va);
+                bool b_null = is_null(vb);
+                if (a_null && b_null) return false;
+                if (a_null)           return false;
+                if (b_null)           return true;
+
+                bool less_than = value_less_than(va, vb);
+                return ascending ? less_than : !less_than;
+            });
+    }
+
+    for (auto& [order_key, row_out] : output_rows) {
+        (void)order_key;
         result.rows.push_back(std::move(row_out));
     }
 
@@ -2150,13 +2300,15 @@ bool Executor::evaluate_compare(const CompareExpr&   expr,
 bool Executor::evaluate_having(const HavingExprPtr&           expr,
                                 const std::vector<ScanResult>& group_rows,
                                 const TableSchema&              schema,
-                                const std::string&               alias) const
+                                const std::string&               alias,
+                                const TableSchema*                right_schema,
+                                const std::string&                right_alias) const
 {
     if (!expr) return true;
 
     if (expr->kind == HavingExpr::Kind::COMPARE) {
         const HavingCompareExpr& c = expr->compare;
-        Value lhs = compute_aggregate_value(c.operand, group_rows, schema, alias);
+        Value lhs = compute_aggregate_value(c.operand, group_rows, schema, alias, right_schema, right_alias);
 
         // SQL NULL semantics: any comparison with NULL yields false — same
         // rule evaluate_compare applies for WHERE (a group whose aggregate
@@ -2170,13 +2322,13 @@ bool Executor::evaluate_having(const HavingExprPtr&           expr,
     // LOGICAL node — identical shape to evaluate_where's LOGICAL handling
     switch (expr->logical_op) {
         case LogicalOp::AND:
-            return evaluate_having(expr->left,  group_rows, schema, alias) &&
-                   evaluate_having(expr->right, group_rows, schema, alias);
+            return evaluate_having(expr->left,  group_rows, schema, alias, right_schema, right_alias) &&
+                   evaluate_having(expr->right, group_rows, schema, alias, right_schema, right_alias);
         case LogicalOp::OR:
-            return evaluate_having(expr->left,  group_rows, schema, alias) ||
-                   evaluate_having(expr->right, group_rows, schema, alias);
+            return evaluate_having(expr->left,  group_rows, schema, alias, right_schema, right_alias) ||
+                   evaluate_having(expr->right, group_rows, schema, alias, right_schema, right_alias);
         case LogicalOp::NOT:
-            return !evaluate_having(expr->left, group_rows, schema, alias);
+            return !evaluate_having(expr->left, group_rows, schema, alias, right_schema, right_alias);
     }
     return false;
 }

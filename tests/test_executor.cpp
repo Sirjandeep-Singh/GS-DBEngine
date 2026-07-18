@@ -1422,6 +1422,102 @@ void test_select_having_without_group_by_rejected() {
     cleanup();
 }
 
+void test_select_group_by_order_by_plain_column() {
+    cleanup();
+    Env env;
+    seed_people(env);  // eng: 10 rows, sales: 40 rows
+
+    auto r = exec(env, "SELECT dept, COUNT(*) FROM people GROUP BY dept ORDER BY dept DESC;");
+    assert(r.success);
+    assert(r.rows.size() == 2);
+    assert(r.rows[0][0] == "sales");  // 's' > 'e', so DESC puts sales first
+    assert(r.rows[1][0] == "eng");
+
+    std::cout << "[PASS] GROUP BY ... ORDER BY <grouped column> DESC sorts the groups\n";
+    cleanup();
+}
+
+void test_select_group_by_order_by_aggregate() {
+    cleanup();
+    Env env;
+    seed_people(env);  // eng: 10 rows, sales: 40 rows
+
+    auto r = exec(env, "SELECT dept, COUNT(*) FROM people GROUP BY dept ORDER BY COUNT(*) DESC;");
+    assert(r.success);
+    assert(r.rows.size() == 2);
+    assert(r.rows[0][0] == "sales");
+    assert(r.rows[0][1] == "40");
+    assert(r.rows[1][0] == "eng");
+    assert(r.rows[1][1] == "10");
+
+    std::cout << "[PASS] GROUP BY ... ORDER BY COUNT(*) DESC sorts groups by the aggregate value\n";
+    cleanup();
+}
+
+void test_select_group_by_order_by_aggregate_not_in_select_list() {
+    cleanup();
+    Env env;
+    seed_skewed_values(env);  // grp 'a': avg 22.0 | grp 'b': avg 20.0
+
+    // ORDER BY here references AVG(val) even though the SELECT list only
+    // projects grp — real SQL allows this, and compute_aggregate_value
+    // computes it fresh from the group's rows regardless of what's
+    // projected, same as HAVING already does.
+    auto r = exec(env, "SELECT grp FROM t GROUP BY grp ORDER BY AVG(val) ASC;");
+    assert(r.success);
+    assert(r.rows.size() == 2);
+    assert(r.rows[0][0] == "b");  // avg 20.0 < avg 22.0
+    assert(r.rows[1][0] == "a");
+
+    std::cout << "[PASS] ORDER BY can reference an aggregate not present in the SELECT list\n";
+    cleanup();
+}
+
+void test_select_group_by_order_by_then_limit() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // Sorting must happen before LIMIT truncates, not after.
+    auto r = exec(env,
+        "SELECT dept, COUNT(*) FROM people GROUP BY dept ORDER BY COUNT(*) DESC LIMIT 1;");
+    assert(r.success);
+    assert(r.rows.size() == 1);
+    assert(r.rows[0][0] == "sales");
+    assert(r.rows[0][1] == "40");
+
+    std::cout << "[PASS] GROUP BY ... ORDER BY ... LIMIT sorts before truncating\n";
+    cleanup();
+}
+
+void test_select_group_by_order_by_ungrouped_column_rejected() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // 'age' is neither an aggregate nor a GROUP BY column — same rule as
+    // the SELECT-list validation, applied to ORDER BY's operand too.
+    auto r = exec(env, "SELECT dept, COUNT(*) FROM people GROUP BY dept ORDER BY age;");
+    assert(!r.success);
+
+    std::cout << "[PASS] ORDER BY on a column absent from GROUP BY is rejected\n";
+    cleanup();
+}
+
+void test_select_order_by_aggregate_without_group_by_rejected() {
+    cleanup();
+    Env env;
+    seed_people(env);
+
+    // No GROUP BY at all, and the SELECT list isn't an aggregate query
+    // either — ORDER BY COUNT(*) has nothing to group over.
+    auto r = exec(env, "SELECT age FROM people ORDER BY COUNT(*);");
+    assert(!r.success);
+
+    std::cout << "[PASS] ORDER BY on an aggregate without GROUP BY is rejected\n";
+    cleanup();
+}
+
 void test_select_max_min_skip_nulls() {
     cleanup();
     Env env;
@@ -1606,17 +1702,93 @@ void test_select_group_by_ungrouped_plain_column_rejected() {
     cleanup();
 }
 
-void test_select_group_by_with_join_rejected() {
+void test_select_group_by_with_join() {
     cleanup();
     Env env;
     seed_orders_customers(env, false);
 
+    // cust1: orders (10, 50) -> count 2; cust2: (20) -> count 1;
+    // cust3: (5, 60, 70) -> count 3; cust5: (15) -> count 1.
+    // Customers with no orders (4, 6-10) are excluded by the INNER JOIN.
     auto r = exec(env,
         "SELECT customers.name, COUNT(*) FROM customers "
         "INNER JOIN orders ON customers.id = orders.customer_id GROUP BY customers.name;");
-    assert(!r.success);
+    assert(r.success);
+    assert(r.columns.size() == 2);
+    assert(r.columns[0] == "name");
+    assert(r.columns[1] == "COUNT(*)");
+    assert(r.rows.size() == 4);  // exactly four customers have orders
 
-    std::cout << "[PASS] GROUP BY with JOIN is rejected (v1 scope)\n";
+    // std::map key ordering sorts group values ascending by name.
+    assert(r.rows[0][0] == "cust1");
+    assert(r.rows[0][1] == "2");
+    assert(r.rows[1][0] == "cust2");
+    assert(r.rows[1][1] == "1");
+    assert(r.rows[2][0] == "cust3");
+    assert(r.rows[2][1] == "3");
+    assert(r.rows[3][0] == "cust5");
+    assert(r.rows[3][1] == "1");
+
+    std::cout << "[PASS] GROUP BY with JOIN groups the joined rows correctly\n";
+    cleanup();
+}
+
+void test_select_group_by_with_join_having() {
+    cleanup();
+    Env env;
+    seed_orders_customers(env, false);
+
+    // Only cust3 has more than 2 orders.
+    auto r = exec(env,
+        "SELECT customers.name, COUNT(*) FROM customers "
+        "INNER JOIN orders ON customers.id = orders.customer_id "
+        "GROUP BY customers.name HAVING COUNT(*) > 2;");
+    assert(r.success);
+    assert(r.rows.size() == 1);
+    assert(r.rows[0][0] == "cust3");
+    assert(r.rows[0][1] == "3");
+
+    std::cout << "[PASS] GROUP BY with JOIN and HAVING filters groups correctly\n";
+    cleanup();
+}
+
+void test_select_group_by_with_join_where_and_aggregate_column() {
+    cleanup();
+    Env env;
+    seed_orders_customers(env, false);
+
+    // WHERE filters the joined rows before grouping — only cust3's orders
+    // remain, so MAX(amount) reflects just its own three orders (5, 60, 70).
+    auto r = exec(env,
+        "SELECT customers.name, MAX(orders.amount) FROM customers "
+        "INNER JOIN orders ON customers.id = orders.customer_id "
+        "WHERE customers.name = 'cust3' GROUP BY customers.name;");
+    assert(r.success);
+    assert(r.rows.size() == 1);
+    assert(r.rows[0][0] == "cust3");
+    assert(r.rows[0][1] == "70.000000");
+
+    std::cout << "[PASS] GROUP BY with JOIN honours WHERE before grouping and MAX aggregates correctly\n";
+    cleanup();
+}
+
+void test_select_aggregate_with_join_no_group_by() {
+    cleanup();
+    Env env;
+    seed_orders_customers(env, false);
+
+    // No GROUP BY — a single aggregate row over every joined (customer,
+    // order) pair. seed_orders_customers has 7 orders total, all with a
+    // matching customer, so the INNER JOIN yields 7 rows.
+    auto r = exec(env,
+        "SELECT COUNT(*), MAX(orders.amount) FROM customers "
+        "INNER JOIN orders ON customers.id = orders.customer_id;");
+    assert(r.success);
+    assert(r.rows.size() == 1);
+    assert(r.rows[0][0] == "7");
+    assert(r.rows[0][1] == "70.000000");
+
+    std::cout << "[PASS] Aggregate (no GROUP BY) with JOIN computes over every joined row\n";
     cleanup();
 }
 
@@ -1862,7 +2034,10 @@ int main() {
     test_select_group_by_count_column_skips_nulls();
     test_select_group_by_nulls_form_one_group();
     test_select_group_by_ungrouped_plain_column_rejected();
-    test_select_group_by_with_join_rejected();
+    test_select_group_by_with_join();
+    test_select_group_by_with_join_having();
+    test_select_group_by_with_join_where_and_aggregate_column();
+    test_select_aggregate_with_join_no_group_by();
     test_select_group_by_max_min_avg_median();
 
     std::cout << "\n=== HAVING Tests ===\n";
@@ -1872,6 +2047,12 @@ int main() {
     test_select_having_on_plain_grouped_column();
     test_select_having_no_matching_groups_returns_empty_success();
     test_select_having_without_group_by_rejected();
+    test_select_group_by_order_by_plain_column();
+    test_select_group_by_order_by_aggregate();
+    test_select_group_by_order_by_aggregate_not_in_select_list();
+    test_select_group_by_order_by_then_limit();
+    test_select_group_by_order_by_ungrouped_column_rejected();
+    test_select_order_by_aggregate_without_group_by_rejected();
 
     test_update_where_indexed_equality();
     test_delete_where_unique_index_deletes_one_row();

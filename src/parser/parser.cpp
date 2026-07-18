@@ -252,7 +252,7 @@ std::vector<OrderByClause> Parser::parse_order_by() {
     std::vector<OrderByClause> clauses;
     do {
         OrderByClause clause;
-        clause.column    = parse_column_ref();
+        clause.operand   = parse_aggregate_or_column();
         clause.ascending = true;
         if (match(TokenType::DESC)) clause.ascending = false;
         else match(TokenType::ASC);  // optional ASC, default anyway

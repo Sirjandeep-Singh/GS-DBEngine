@@ -136,7 +136,7 @@ void test_select_order_by_asc() {
     auto& s = std::get<SelectStmt>(stmt);
 
     assert(s.order_by.size() == 1);
-    assert(s.order_by[0].column.column_name == "age");
+    assert(s.order_by[0].operand.column.column_name == "age");
     assert(s.order_by[0].ascending == true);
 
     std::cout << "[PASS] SELECT * FROM table ORDER BY col ASC\n";
@@ -315,11 +315,25 @@ void test_select_group_by_then_order_by_and_limit() {
     assert(s.group_by.size() == 1);
     assert(s.group_by[0].column_name == "dept");
     assert(s.order_by.size() == 1);
-    assert(s.order_by[0].column.column_name == "dept");
+    assert(s.order_by[0].operand.column.column_name == "dept");
     assert(s.limit.has_value());
     assert(s.limit.value() == 5);
 
     std::cout << "[PASS] GROUP BY composes with a following ORDER BY and LIMIT\n";
+}
+
+void test_select_order_by_aggregate() {
+    // ORDER BY's operand can be an aggregate call, not just a bare column —
+    // needed for "ORDER BY COUNT(*) DESC" style GROUP BY queries.
+    auto stmt = parse(
+        "SELECT dept, COUNT(*) FROM people GROUP BY dept ORDER BY COUNT(*) DESC;");
+    auto& s = std::get<SelectStmt>(stmt);
+
+    assert(s.order_by.size() == 1);
+    assert(s.order_by[0].operand.aggregate == AggregateType::COUNT_STAR);
+    assert(s.order_by[0].ascending == false);
+
+    std::cout << "[PASS] ORDER BY COUNT(*) DESC parses the operand as an aggregate\n";
 }
 
 void test_select_limit() {
@@ -797,6 +811,7 @@ int main() {
     test_select_group_by_multiple_columns();
     test_select_group_by_absent_by_default();
     test_select_group_by_then_order_by_and_limit();
+    test_select_order_by_aggregate();
     test_select_group_by_with_multiple_aggregates();
     test_select_having_absent_by_default();
     test_select_having_aggregate_compare();

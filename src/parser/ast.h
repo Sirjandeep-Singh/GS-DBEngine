@@ -161,9 +161,15 @@ struct JoinClause {
     ColumnRef   right_col;
 };
 
+// ORDER BY's sort key. Holds a SelectColumn rather than a bare ColumnRef so
+// it can reference an aggregate too — "ORDER BY COUNT(*)" only makes sense
+// under GROUP BY (rejected otherwise; see execute_select and
+// execute_select_group_by), but needs somewhere to carry the aggregate
+// when it's used there. Plain "ORDER BY col" just leaves `operand.aggregate`
+// as NONE, same as any other non-aggregate SelectColumn.
 struct OrderByClause {
-    ColumnRef column;
-    bool      ascending = true;
+    SelectColumn operand;
+    bool         ascending = true;
 };
 
 struct SelectStmt {
