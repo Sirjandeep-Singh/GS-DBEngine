@@ -14,6 +14,8 @@
 //   ./tests/gsdb < file.sql   — pipe a SQL script
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <iostream>
 #include <numeric>
 #include <string>
@@ -26,6 +28,16 @@
 // Table formatter
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Formats a duration as "(0.003 sec)", matching the style used by mysql/psql
+// clients. Always 3 decimal places regardless of magnitude, since that's
+// plenty of resolution for interactive queries and keeps the width stable.
+static std::string format_elapsed(std::chrono::duration<double> elapsed)
+{
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "(%.3f sec)", elapsed.count());
+    return std::string(buf);
+}
+
 // Prints a QueryResult as a fixed-width ASCII table, e.g.:
 //   +----+-------+-----+
 //   | id | name  | age |
@@ -33,14 +45,15 @@
 //   |  1 | Alice |  25 |
 //   +----+-------+-----+
 //   1 row(s)
-static void print_table(const QueryResult& r)
+static void print_table(const QueryResult& r, std::chrono::duration<double> elapsed)
 {
     if (r.columns.empty() && r.rows.empty()) {
         // DDL / DML with no result set — just print the affected count
         if (r.rows_affected > 0) {
-            std::cout << "OK (" << r.rows_affected << " row(s) affected)\n";
+            std::cout << "OK (" << r.rows_affected << " row(s) affected) "
+                      << format_elapsed(elapsed) << "\n";
         } else {
-            std::cout << "OK\n";
+            std::cout << "OK " << format_elapsed(elapsed) << "\n";
         }
         return;
     }
@@ -87,7 +100,7 @@ static void print_table(const QueryResult& r)
     }
     print_separator();
 
-    std::cout << r.rows.size() << " row(s)\n";
+    std::cout << r.rows.size() << " row(s) in set " << format_elapsed(elapsed) << "\n";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -265,9 +278,14 @@ int main()
             // EOF (Ctrl+D or end of piped file)
             if (!buffer.empty()) {
                 // Execute any trailing SQL that has no semicolon
+                const auto t0 = std::chrono::steady_clock::now();
                 QueryResult r = db.execute(buffer);
+                const auto elapsed = std::chrono::steady_clock::now() - t0;
                 if (!r.success) {
-                    std::cerr << "ERROR: " << r.error_message << '\n';
+                    std::cerr << "ERROR: " << r.error_message << ' '
+                              << format_elapsed(elapsed) << '\n';
+                } else {
+                    print_table(r, elapsed);
                 }
             }
             if (interactive) std::cout << "\nBye.\n";
@@ -304,13 +322,16 @@ int main()
         }
 
         // Execute the complete statement
+        const auto t0 = std::chrono::steady_clock::now();
         QueryResult result = db.execute(buffer);
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
         buffer.clear();
 
         if (!result.success) {
-            std::cerr << "ERROR: " << result.error_message << '\n';
+            std::cerr << "ERROR: " << result.error_message << ' '
+                      << format_elapsed(elapsed) << '\n';
         } else {
-            print_table(result);
+            print_table(result, elapsed);
         }
 
         if (interactive) std::cout << '\n';
